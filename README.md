@@ -113,6 +113,18 @@ SegHiero/
     4. An SGD optimizer  
     5. Training & validation loops that compute loss + pixel accuracy and checkpoint when validation loss improves.
 
+- **`infer.py`**
+    - Loads a YAML config plus a ``.pth`` checkpoint and runs a single‐image inference:
+        1. Parses command‐line arguments (``--config``, ``--checkpoint``, ``--image``, ``--device``)
+        2. Reads the same YAML to build ``HieroDataloader``’s transforms (resize, normalize, etc.)
+        3. Instantiates the backbone (e.g. ``ResNetBackbone``) and ``DepthwiseSeparableASPPContrastHead`` (with the correct output channels)
+        4. Chooses the 2‐level (``HieraTripletLoss‐type``) or 3‐level (``RMIHieraTripletLoss‐type``) head structure based on whether the config has super‐coarse maps
+        5. Loads model weights from the provided checkpoint onto the specified device (CPU or GPU)
+        6. Preprocesses the input image (resize, normalize, convert to tensor), runs it through the network, and upsamples the logits to full resolution
+        7. Applies ``argmax`` over the fine‐class logits (first ``n_fine`` channels) to produce a predicted mask, then maps back to coarse/super‐coarse if desired
+        8. Saves or displays the resulting segmentation mask (e.g. as a PNG or overlaid on the original image)
+        9. Optionally prints out per‐pixel class counts or an overall “pixel accuracy” if a ground‐truth mask is provided
+        10. Allows switching between CUDA/CPU via the ``--device`` flag.
 ---
 
 ## Installation
