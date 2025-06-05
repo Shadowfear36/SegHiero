@@ -1,0 +1,51 @@
+dataset:
+    root: '/path/to/your/dataset'
+    train:
+      image_subdir: '/subdir'
+      mask_subdir: '/subdir'
+    val:
+      image_subdir: '/subdir'
+      mask_subdir: '/subdir'
+classes:
+    super_coarse_to_coarse_map: [[0, 2], [3]]
+    super_coarse_names:
+      0: Plant
+      1: Fungus
+    coarse_to_fine_map: [[0,3], [4,6], [7], [8]]
+    coarse_names:
+      0: Flower
+      1: Tree
+      2: Grass
+      3: Mushroom
+    fine_names:
+      0: Sunflower
+      1: Lily
+      2: Rose
+      3: Tulip
+      4: Juniper
+      5: Oak
+      6: Palm
+      7: Bermuda
+      8: Lions Mane
+    
+model:
+  pretrained_model: resnet-101
+
+training:
+  epochs: 50
+  batch_size: 8
+  lr: 0.001
+  device: "cuda"
+  fine_weight: 1.0
+  coarse_weight: 1.0
+  super_weight:   1.0 
+  num_workers:  1
+  gpus: [0]
+
+transform:
+  resize: [150, 150]
+  hflip_prob: 0.5
+
+output:
+  checkpoint_dir: "./"
+  project_name: "fun"
