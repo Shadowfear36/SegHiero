@@ -79,8 +79,7 @@ SegHiero/
 │ └── rmi_hiera_triplet_loss.py # 3‐level RMIHieraTripletLoss
 │
 ├── train.py # Main training & validation script, consumes a single YAML config
-├── config.yaml # Example 3‐level hierarchy config
-└── 2l-config.yaml # Example 2‐level hierarchy config
+└── example-config.yaml # Example hierarchy config
 ```
 
 
@@ -118,7 +117,7 @@ SegHiero/
 
 1. **Clone the repo**  
    ```bash
-   git clone https://github.com/yourusername/SegHiero.git
+   git clone https://github.com/Shadowfear36/SegHiero
    cd SegHiero
 2. **Create A Virtual Environment**
     ```bash
