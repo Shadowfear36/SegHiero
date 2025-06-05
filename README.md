@@ -79,6 +79,7 @@ SegHiero/
 │ └── rmi_hiera_triplet_loss.py # 3‐level RMIHieraTripletLoss
 │
 ├── train.py # Main training & validation script, consumes a single YAML config
+├── infer.py # Main inference script, consumes a single YAML config, image path, checkpoint path, device, and output directory
 └── example-config.yaml # Example hierarchy config
 ```
 
