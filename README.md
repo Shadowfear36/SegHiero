@@ -80,6 +80,7 @@ SegHiero/
 │
 ├── train.py # Main training & validation script, consumes a single YAML config
 ├── infer.py # Main inference script, consumes a single YAML config, image path, checkpoint path, device, and output directory
+├── requirements.txt # Dependencies
 └── example-config.yaml # Example hierarchy config
 ```
 
