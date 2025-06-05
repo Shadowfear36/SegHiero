@@ -327,3 +327,14 @@ Every training run is driven by a single YAML file. Below is a breakdown of each
         - Two‐level: ``HieraTripletLoss(num_classes, hiera_map, hiera_index, use_sigmoid=False, loss_weight=…)``
         - Three‐level: ``RMIHieraTripletLoss(n_fine, n_mid, n_high, fine_to_mid, fine_to_high, rmi_radius, rmi_pool_way, rmi_pool_size, rmi_pool_stride, loss_weight_lambda, loss_weight, ignore_index)``
 ## License & Acknowledgements
+**Inspired by**
+- HieraSeg [https://github.com/lingorX/HieraSeg]
+
+```
+@article{li2022deep,
+  title={Deep Hierarchical Semantic Segmentation},
+  author={Li, Liulei and Zhou, Tianfei and Wang, Wenguan and Li, Jianwu and Yang, Yi},
+  journal={arXiv preprint arXiv:2203.14335},
+  year={2022}
+}
+```
