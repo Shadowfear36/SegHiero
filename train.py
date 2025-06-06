@@ -385,7 +385,7 @@ def main():
                 fine_mask = batch[1].to(device, non_blocking=True)
 
                 c1, c2, c3, c4 = backbone(img_t)
-                main_logits, _ = aspp_head([c1, c2, c3, c4])
+                main_logits, embedding = aspp_head([c1, c2, c3, c4])
 
                 B, _, H4, W4 = main_logits.shape
                 H, W = fine_mask.shape[-2:]
@@ -400,19 +400,19 @@ def main():
                 step_tensor = torch.tensor([epoch], dtype=torch.long, device=device)
                 if not has_super:
                     main_loss = hiera_loss_fn(
-                        step_tensor,
-                        logit_before_full[:, :n_fine, :, :],
-                        logit_after_full,
-                        fine_mask,
-                        embedding=None,  # embedding isn’t used in validation for RMI portion
-                    )
+                    step_tensor,
+                    embedding,
+                    logit_before_full[:, :n_fine, :, :],
+                    logit_after_full,
+                    fine_mask
+                )
                 else:
                     main_loss = hiera_loss_fn(
                         step_tensor,
+                        embedding,
                         logit_before_full[:, :n_fine, :, :],
                         logit_after_full,
-                        fine_mask,
-                        embedding=None,
+                        fine_mask
                     )
 
                 aux_logits = aux_head(c3)
