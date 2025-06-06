@@ -429,7 +429,7 @@ def main():
             os.makedirs(cfg["output"]["checkpoint_dir"], exist_ok=True)
             save_path = os.path.join(
                 cfg["output"]["checkpoint_dir"],
-                f"{cfg['output']['project_name']}_best.pth"
+                f"{cfg['output']['project_name']}_epoch_{epoch}_best.pth"
             )
             torch.save(ckpt, save_path)
             print(f"→ Saved new best model to {save_path}\n")
