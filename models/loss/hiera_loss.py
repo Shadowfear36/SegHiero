@@ -114,8 +114,6 @@ def losses_hiera_focal(predictions, targets, targets_middle, targets_top, num_cl
 
     return loss
 
-
-@LOSSES.register_module()
 class HieraLoss2(nn.Module):
 
     def __init__(self,

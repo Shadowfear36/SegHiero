@@ -112,6 +112,7 @@ SegHiero/
     3. One of `HieraTripletLoss` (2‐level) or `RMIHieraTripletLoss` (3‐level) depending on whether super‐coarse maps exist in YAML  
     4. An SGD optimizer  
     5. Training & validation loops that compute loss + pixel accuracy and checkpoint when validation loss improves.
+    6. Can also pass ``--pretrained`` to start training from a pretrained model
 
 - **`infer.py`**
     - Loads a YAML config plus a ``.pth`` checkpoint and runs a single‐image inference:
@@ -278,7 +279,7 @@ Every training run is driven by a single YAML file. Below is a breakdown of each
 ## Training & Validation
 - After preparing your dataset and writing a config file:
     ```bash
-    python train.py --config /path/to/config.yaml
+    python train.py --config /path/to/config.yaml --pretrained /path/to/pretrained/model #(<- optional)
     ```
 - What happens:
     1. Dataset
