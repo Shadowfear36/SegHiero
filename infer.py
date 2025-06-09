@@ -1,23 +1,64 @@
-# infer.py
+# train.py
 
 import os
 import argparse
 import yaml
-from PIL import Image, ImageDraw, ImageFont
-import numpy as np
 import torch
-import torch.nn.functional as F
-from torchvision import transforms
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from terminaltables import AsciiTable
 
-# Replace these imports with your actual model paths:
+from dataset.dataloader import HieroDataloader
+
+# Replace these with your actual import paths:
 from models.backbone.resnet import ResNetBackbone
 from models.head.sep_aspp_contrast_head import DepthwiseSeparableASPPContrastHead
+
+# Two versions of the loss, one for 2-level and one for 3-level
+from models.loss.hiera_triplet_loss import HieraTripletLoss
+from models.loss.rmi_hiera_triplet_loss import RMIHieraTripletLoss
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train a Hiera-Segmentation model using a single YAML config"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="Path to the YAML config file",
+    )
+    parser.add_argument(
+        "--pretrained",
+        type=str,
+        default=None,
+        help="Path to a pretrained checkpoint (.pth) to initialize the model (optional)",
+    )
+    return parser.parse_args()
+
+
+def compute_pixel_accuracy(preds: torch.Tensor, targets: torch.Tensor, ignore_index=255):
+    """
+    Compute pixel accuracy over non-ignored pixels.
+    preds:   [B, H, W] (predicted class indices)
+    targets: [B, H, W] (ground-truth class indices, 0..n_fine−1 or 255 to ignore)
+    """
+    valid = (targets != ignore_index)
+    correct = (preds == targets) & valid
+    total_correct = correct.sum().item()
+    total_valid = valid.sum().item()
+    if total_valid == 0:
+        return 0.0
+    return total_correct / total_valid
 
 
 def build_fine_to_coarse_map(coarse_to_fine_cfg: list, n_fine: int) -> torch.Tensor:
     """
     Given `coarse_to_fine_map` from YAML (a list of [start,end] or [lbl]),
-    build a LongTensor of length = n_fine mapping each fine→coarse index.
+    build a LongTensor of length = n_fine mapping each fine→coarse.
     """
     mapping = torch.empty(n_fine, dtype=torch.long)
     for coarse_idx, sub in enumerate(coarse_to_fine_cfg):
@@ -29,6 +70,23 @@ def build_fine_to_coarse_map(coarse_to_fine_cfg: list, n_fine: int) -> torch.Ten
             for f in range(start, end + 1):
                 mapping[f] = coarse_idx
     return mapping
+
+
+def build_hiera_index(coarse_to_fine_cfg: list) -> list:
+    """
+    Build “hiera_index” list of [start, end+1] for each coarse bucket.
+    If YAML entry was [x] → we return [x, x+1].
+    If YAML entry was [start, end] → we return [start, end+1].
+    """
+    hiera_index = []
+    for sub in coarse_to_fine_cfg:
+        if len(sub) == 1:
+            lbl = int(sub[0])
+            hiera_index.append([lbl, lbl + 1])
+        else:
+            start, end = int(sub[0]), int(sub[1])
+            hiera_index.append([start, end + 1])
+    return hiera_index
 
 
 def build_fine_to_super_map(super_to_coarse_cfg: list, n_fine: int) -> torch.Tensor:
@@ -47,210 +105,63 @@ def build_fine_to_super_map(super_to_coarse_cfg: list, n_fine: int) -> torch.Ten
     return mapping
 
 
-def preprocess_image(img_path: str, resize: tuple):
-    """
-    Load an image, resize if requested, convert to normalized tensor.
-
-    Returns:
-      img_tensor: [1, 3, H', W']
-      orig_size:  (orig_H, orig_W)
-      proc_size:  (H', W')
-      orig_pil:   original PIL RGB image
-    """
-    img = Image.open(img_path).convert("RGB")
-    orig_W, orig_H = img.size
-
-    if resize is not None:
-        img = img.resize(resize, Image.BILINEAR)
-        proc_W, proc_H = resize
-    else:
-        proc_W, proc_H = orig_W, orig_H
-
-    to_tensor = transforms.ToTensor()
-    normalize = transforms.Normalize(mean=(0.485, 0.456, 0.406),
-                                     std=(0.229, 0.224, 0.225))
-    img_t = to_tensor(img)
-    img_t = normalize(img_t)
-    img_t = img_t.unsqueeze(0)  # [1,3,H',W']
-    return img_t, (orig_H, orig_W), (proc_H, proc_W), img
-
-
-def save_mask(mask: np.ndarray, save_path: str):
-    """
-    Save a 2D numpy array (H×W) of integer class IDs as a PNG.
-    """
-    im = Image.fromarray(mask.astype(np.uint8))
-    im.save(save_path)
-
-
-def create_colormap(n: int):
-    """
-    Create a simple color map of n distinct RGB values.
-    """
-    base_colors = [
-        (128, 64, 128),   # purple-ish
-        (244, 35, 232),   # pink
-        (70, 70, 70),     # dark gray
-        (102, 102, 156),  # lavender
-        (190, 153, 153),  # pale pink
-        (153, 153, 153),  # light gray
-        (250, 170, 30),   # orange
-        (220, 220, 0),    # yellow
-        (107, 142, 35),   # olive
-        (152, 251, 152),  # pale green
-        (70, 130, 180),   # steel blue
-        (220, 20, 60),    # crimson
-        (255, 0, 0),      # red
-        (0, 0, 142),      # navy
-        (0, 0, 70),       # dark blue
-        (0, 60, 100),     # slate
-        (0, 80, 100),     # teal
-        (0, 0, 230),      # bright blue
-        (119, 11, 32),    # maroon
-    ]
-    cmap = []
-    for i in range(n):
-        cmap.append(base_colors[i % len(base_colors)])
-    return cmap
-
-
-def mask_to_color_image(mask: np.ndarray, colormap: list) -> Image.Image:
-    """
-    Convert a 2D numpy mask (H×W) to a full-color PIL image using colormap.
-    """
-    H, W = mask.shape
-    color_img = Image.new("RGB", (W, H))
-    pixels = color_img.load()
-    for y in range(H):
-        for x in range(W):
-            class_id = int(mask[y, x])
-            if class_id < 0:
-                pixels[x, y] = (0, 0, 0)
-            else:
-                pixels[x, y] = colormap[class_id]
-    return color_img
-
-
-def draw_class_indices(mask: np.ndarray,
-                       base_img: Image.Image,
-                       font_path: str = None) -> Image.Image:
-    """
-    Draw each class index number at the centroid of its region in the mask.
-    - mask:     2D numpy array (H×W) of class IDs
-    - base_img: PIL RGB image on which to draw indices (should match mask size)
-
-    Uses draw.textbbox(...) to measure text dimensions.
-    """
-    H, W = mask.shape
-    result = base_img.copy()
-    draw = ImageDraw.Draw(result)
-    try:
-        font = ImageFont.truetype(font_path or "arial.ttf", size=max(12, W // 100))
-    except Exception:
-        font = ImageFont.load_default()
-
-    class_ids = np.unique(mask)
-    for class_id in class_ids:
-        if class_id < 0:
-            continue
-        ys, xs = np.where(mask == class_id)
-        if len(xs) == 0:
-            continue
-        centroid_x = int(xs.mean())
-        centroid_y = int(ys.mean())
-        text = str(class_id)
-
-        # Use draw.textbbox to compute width/height:
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_w = bbox[2] - bbox[0]
-        text_h = bbox[3] - bbox[1]
-        text_position = (centroid_x - text_w // 2, centroid_y - text_h // 2)
-
-        # Draw black outline
-        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            draw.text((text_position[0] + dx, text_position[1] + dy),
-                      text, font=font, fill="black")
-        # Draw white text
-        draw.text(text_position, text, fill="white", font=font)
-
-    return result
-
-
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run inference on a single image using a trained SegHiero model and YAML config"
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        required=True,
-        help="Path to the YAML config file",
-    )
-    parser.add_argument(
-        "--image",
-        type=str,
-        required=True,
-        help="Path to the input image file",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="Path to a .pth checkpoint. Overrides config if provided",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="Override device (e.g., 'cpu' or 'cuda:0'); defaults to config['training']['device']",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=".",
-        help="Directory to save predicted masks + colored overlays (default: current directory)",
-    )
-    args = parser.parse_args()
+    args = parse_args()
 
     # 1) Load config.yaml
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
 
-    # Determine device
-    if args.device:
-        device = torch.device(args.device)
-    else:
-        device = torch.device(cfg["training"]["device"])
+    # 1.1) If user supplied a “gpus” list, set CUDA_VISIBLE_DEVICES accordingly
+    if "gpus" in cfg["training"]:
+        gpu_list = cfg["training"]["gpus"]
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(x) for x in gpu_list)
+        print(f"→ Using GPUs {gpu_list}, primary device = {torch.device(cfg['training']['device'])}")
 
-    # 2) Read class-name dictionaries
-    fine_names_dict   = {int(k): v for k, v in cfg["classes"]["fine_names"].items()}
-    coarse_names_dict = {int(k): v for k, v in cfg["classes"]["coarse_names"].items()}
-    has_super         = "super_coarse_names" in cfg["classes"]
-    super_names_dict  = {}
-    if has_super:
-        super_names_dict = {int(k): v for k, v in cfg["classes"]["super_coarse_names"].items()}
+    device = torch.device(cfg["training"]["device"])
+    # Immediately verify how many GPUs PyTorch sees
+    num_visible = torch.cuda.device_count()
+    print(f"[DEBUG] torch.cuda.device_count() = {num_visible}, torch.cuda.current_device() = {torch.cuda.current_device()}")
 
-    n_fine   = len(fine_names_dict)
-    n_coarse = len(coarse_names_dict)
-    n_super  = len(super_names_dict) if has_super else 0
+    # 2) Build Datasets + DataLoaders
+    train_ds = HieroDataloader(args.config, split="train")
+    val_ds   = HieroDataloader(args.config, split="val")
 
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg["training"]["batch_size"],
+        shuffle=True,
+        num_workers=cfg["training"].get("num_workers", 4),
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=cfg["training"]["batch_size"],
+        shuffle=False,
+        num_workers=cfg["training"].get("num_workers", 4),
+        pin_memory=True,
+    )
+
+    print(f"Number of train samples: {len(train_ds)}")
+    print(f"Number of val   samples: {len(val_ds)}")
+
+    # 3) Count classes
+    n_fine   = len(cfg["classes"]["fine_names"])
+    n_coarse = len(cfg["classes"]["coarse_names"])
+    has_super = "super_coarse_names" in cfg["classes"]
+    n_super  = len(cfg["classes"].get("super_coarse_names", {}))
+
+    # Depending on whether super_coarse is in the YAML, choose 2-level or 3-level loss
     if has_super:
         total_classes = n_fine + n_coarse + n_super
     else:
         total_classes = n_fine + n_coarse
 
-    # 3) Build mapping tensors (not used directly for drawing, but consistent with training)
-    if has_super:
-        coarse_to_fine_cfg  = cfg["classes"]["coarse_to_fine_map"]
-        super_to_coarse_cfg = cfg["classes"]["super_coarse_to_coarse_map"]
-        _ = build_fine_to_coarse_map(coarse_to_fine_cfg, n_fine).to(device)
-        _ = build_fine_to_super_map(super_to_coarse_cfg, n_fine).to(device)
-    else:
-        coarse_to_fine_cfg = cfg["classes"]["coarse_to_fine_map"]
-        _ = build_fine_to_coarse_map(coarse_to_fine_cfg, n_fine).to(device)
+    print(f"n_fine={n_fine}, n_coarse={n_coarse}, has_super={has_super}, n_super={n_super}")
+    print(f"Total classes (output dim) = {total_classes}")
 
-    # 4) Build model architecture
-    backbone = ResNetBackbone(depth=101, pretrained=False).to(device)
+    # 4) Build Backbone + Head + (Optional) Aux Head
+    backbone = ResNetBackbone(depth=101, pretrained=True).to(device)
     aspp_head = DepthwiseSeparableASPPContrastHead(
         in_channels=2048,
         c1_in_channels=256,
@@ -261,98 +172,359 @@ def main():
         proj_dim=256,
         proj_type="convmlp",
     ).to(device)
+
+    # Auxiliary head on C3 for fine-class supervision only
+    aux_head = nn.Sequential(
+        nn.Conv2d(1024, n_fine, kernel_size=1, bias=False),
+        nn.BatchNorm2d(n_fine),
+        nn.ReLU(inplace=True),
+    ).to(device)
+
+    # If multiple GPUs are visible, wrap each sub-module in DataParallel
+    if num_visible > 1:
+        print(f"→ Wrapping models in DataParallel (using {num_visible} GPUs)")
+        backbone  = nn.DataParallel(backbone)
+        aspp_head = nn.DataParallel(aspp_head)
+        aux_head   = nn.DataParallel(aux_head)
+
+    # 4.1) If --pretrained was provided, load those weights now
+    if args.pretrained is not None:
+        if not os.path.isfile(args.pretrained):
+            raise FileNotFoundError(f"Pretrained checkpoint not found at {args.pretrained}")
+        print(f"→ Loading pretrained weights from {args.pretrained}")
+        ckpt = torch.load(args.pretrained, map_location=device)
+
+        # If DataParallel, state_dict keys are prefixed by "module.", so strip if necessary
+        def _strip_module(prefix_dict):
+            stripped = {}
+            for k, v in prefix_dict.items():
+                new_k = k.replace("module.", "") if k.startswith("module.") else k
+                stripped[new_k] = v
+            return stripped
+
+        backbone_state = _strip_module(ckpt["backbone_state_dict"])
+        aspp_state     = _strip_module(ckpt["aspp_head_state_dict"])
+        aux_state      = _strip_module(ckpt["aux_head_state_dict"])
+
+        backbone.load_state_dict(backbone_state, strict=False)
+        aspp_head.load_state_dict(aspp_state, strict=False)
+        aux_head.load_state_dict(aux_state, strict=False)
+        print("→ Pretrained weights successfully loaded (backbone + heads)")
+
+    # 5) Build Loss function (either 2-level or 3-level)
+    if not has_super:
+        # ────────────────────────────────────────────────────────
+        # 2-level case:
+        #   - build “fine→coarse” mapping (as a Python list) from YAML
+        #   - build “hiera_index” list so that HieraTripletLoss can consume it
+        # ────────────────────────────────────────────────────────
+        coarse_to_fine_cfg = cfg["classes"]["coarse_to_fine_map"]
+
+        # Build a torch.LongTensor of length=n_fine mapping each fine→coarse
+        fine_to_coarse = build_fine_to_coarse_map(coarse_to_fine_cfg, n_fine)
+
+        # Build hiera_index = [[start,end+1],...] exactly as HieraTripletLoss expects
+        hiera_index = build_hiera_index(coarse_to_fine_cfg)
+
+        # Convert “fine_to_coarse” to a plain Python list for HieraTripletLoss
+        hiera_map_list = fine_to_coarse.tolist()
+
+        hiera_loss_fn = HieraTripletLoss(
+            num_classes=n_fine,
+            hiera_map=hiera_map_list,
+            hiera_index=hiera_index,
+            ignore_index=255,
+            use_sigmoid=False,
+            loss_weight=cfg["training"].get("fine_weight", 1.0),
+        ).to(device)
+
+        if num_visible > 1:
+            hiera_loss_fn = nn.DataParallel(hiera_loss_fn)
+
+    else:
+        # ────────────────────────────────────────────────────────
+        # 3-level case:
+        #   - build fine→mid (coarse) and fine→high (super) maps
+        #   - supply n_fine, n_mid, n_high, plus the two mapping-tensors
+        # ────────────────────────────────────────────────────────
+        coarse_to_fine_cfg  = cfg["classes"]["coarse_to_fine_map"]
+        super_to_coarse_cfg = cfg["classes"]["super_coarse_to_coarse_map"]
+
+        # 1) fine→mid
+        fine_to_mid = build_fine_to_coarse_map(coarse_to_fine_cfg, n_fine)
+
+        # 2) fine→high
+        fine_to_high = build_fine_to_super_map(super_to_coarse_cfg, n_fine)
+
+        n_mid  = n_coarse
+        n_high = n_super
+
+        hiera_loss_fn = RMIHieraTripletLoss(
+            n_fine            = n_fine,
+            n_mid             = n_mid,
+            n_high            = n_high,
+            fine_to_mid       = fine_to_mid,
+            fine_to_high      = fine_to_high,
+            rmi_radius        = cfg["training"].get("rmi_radius", 3),
+            rmi_pool_way      = cfg["training"].get("rmi_pool_way", 0),
+            rmi_pool_size     = cfg["training"].get("rmi_pool_size", 3),
+            rmi_pool_stride   = cfg["training"].get("rmi_pool_stride", 3),
+            loss_weight_lambda= cfg["training"].get("fine_weight", 1.0),
+            loss_weight       = 1.0,
+            ignore_index      = 255,
+        ).to(device)
+
+        if num_visible > 1:
+            hiera_loss_fn = nn.DataParallel(hiera_loss_fn)
+
+    # 6) Auxiliary-only criterion for C3 → fine-classes
+    aux_criterion = nn.CrossEntropyLoss(ignore_index=255)
+
+    # 7) Optimizer
+    optimizer = optim.SGD(
+        list(backbone.parameters())
+        + list(aspp_head.parameters())
+        + list(aux_head.parameters()),
+        lr=cfg["training"]["lr"],
+        momentum=0.9,
+        weight_decay=1e-4,
+    )
+
+    best_val_loss = float("inf")
+    history = []
+
+    # 8) Training loop
+    for epoch in range(cfg["training"]["epochs"]):
+        backbone.train()
+        aspp_head.train()
+        aux_head.train()
+
+        running_train_loss = 0.0
+        train_batches = len(train_loader)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{cfg['training']['epochs']} [Train]")
+
+        for batch in pbar:
+            img_t      = batch[0].to(device, non_blocking=True)  # [B, 3, H, W]
+            fine_mask  = batch[1].to(device, non_blocking=True)  # [B, H, W]
+
+            optimizer.zero_grad()
+
+            # 1) Forward through backbone
+            c1, c2, c3, c4 = backbone(img_t)
+
+            # 2) Main head → logits + embedding
+            main_logits, embedding = aspp_head([c1, c2, c3, c4])
+            # main_logits: [B, total_classes, H/4, W/4]
+
+            B, _, H4, W4 = main_logits.shape
+            H, W = fine_mask.shape[-2:]
+
+            # Build logit_before (downsampled by 2 → 1/8)
+            logit_before_full = nn.functional.interpolate(
+                main_logits, scale_factor=0.5, mode="bilinear", align_corners=False
+            )  # [B, total_classes, H/8, W/8]
+
+            # Build logit_after (upsampled to full resolution H × W)
+            logit_after_full = nn.functional.interpolate(
+                main_logits, size=(H, W), mode="bilinear", align_corners=False
+            )  # [B, total_classes, H, W]
+
+            # 3) Compute hierarchical loss
+            step_tensor = torch.tensor([epoch], dtype=torch.long, device=device)
+
+            if not has_super:
+                # 2-level: pass full logits for fine+coarse to the loss
+                main_loss = hiera_loss_fn(
+                    step_tensor,
+                    embedding,                              # [B, D, H/8, W/8]
+                    logit_before_full[:, :n_fine, :, :],    # just the fine slice before (for triplet)
+                    logit_after_full,                       # full [B, n_fine+n_coarse, H, W]
+                    fine_mask
+                )
+            else:
+                # 3-level: pass full logits for fine+mid+high
+                main_loss = hiera_loss_fn(
+                    step_tensor,
+                    embedding,
+                    logit_before_full[:, :n_fine, :, :],    # fine slice before (triplet only)
+                    logit_after_full,                       # full [B, n_fine+n_mid+n_high, H, W]
+                    fine_mask
+                )
+
+            # 4) Auxiliary head on c3 (fine classes only)
+            aux_logits = aux_head(c3)  # [B, n_fine, H/16, W/16]
+            aux_logits = nn.functional.interpolate(
+                aux_logits, size=(H, W), mode="bilinear", align_corners=False
+            )  # [B, n_fine, H, W]
+            aux_loss = aux_criterion(aux_logits, fine_mask)
+
+            loss = main_loss + 0.4 * aux_loss
+            loss.backward()
+            optimizer.step()
+
+            running_train_loss += loss.item()
+            pbar.set_postfix(train_loss=running_train_loss / (pbar.n + 1))
+
+        avg_train_loss = running_train_loss / train_batches
+
+        # -------------------------------
+        # 9) Validation
+        # -------------------------------
+        backbone.eval()
+        aspp_head.eval()
+        aux_head.eval()
+
+        running_val_loss = 0.0
+        correct_pixels = 0
+        total_pixels = 0
+
+        with torch.no_grad():
+            pbar_val = tqdm(val_loader, desc=f"Epoch {epoch+1}/{cfg['training']['epochs']} [Val]  ")
+            for batch in pbar_val:
+                img_t     = batch[0].to(device, non_blocking=True)
+                fine_mask = batch[1].to(device, non_blocking=True)
+
+                c1, c2, c3, c4 = backbone(img_t)
+                main_logits, embedding = aspp_head([c1, c2, c3, c4])
+
+                B, _, H4, W4 = main_logits.shape
+                H, W = fine_mask.shape[-2:]
+
+                logit_before_full = nn.functional.interpolate(
+                    main_logits, scale_factor=0.5, mode="bilinear", align_corners=False
+                )
+                logit_after_full = nn.functional.interpolate(
+                    main_logits, size=(H, W), mode="bilinear", align_corners=False
+                )
+
+                step_tensor = torch.tensor([epoch], dtype=torch.long, device=device)
+                if not has_super:
+                    main_loss = hiera_loss_fn(
+                    step_tensor,
+                    embedding,
+                    logit_before_full[:, :n_fine, :, :],
+                    logit_after_full,
+                    fine_mask
+                )
+                else:
+                    main_loss = hiera_loss_fn(
+                        step_tensor,
+                        embedding,
+                        logit_before_full[:, :n_fine, :, :],
+                        logit_after_full,
+                        fine_mask
+                    )
+
+                aux_logits = aux_head(c3)
+                aux_logits = nn.functional.interpolate(
+                    aux_logits, size=(H, W), mode="bilinear", align_corners=False
+                )
+                aux_loss = aux_criterion(aux_logits, fine_mask)
+
+                loss = main_loss + 0.4 * aux_loss
+                running_val_loss += loss.item()
+
+                # Compute pixel-accuracy on fine level
+                fine_pred = logit_after_full[:, :n_fine, :, :].argmax(dim=1)
+                batch_correct = (fine_pred == fine_mask) & (fine_mask != 255)
+                correct_pixels += batch_correct.sum().item()
+                total_pixels += (fine_mask != 255).sum().item()
+
+                pbar_val.set_postfix(
+                    val_loss=running_val_loss / (pbar_val.n + 1),
+                    val_acc=correct_pixels / max(total_pixels, 1)
+                )
+
+        avg_val_loss = running_val_loss / len(val_loader)
+        val_acc = correct_pixels / max(total_pixels, 1)
+
+        # Save history
+        history.append({
+            "epoch": epoch + 1,
+            "train_loss": avg_train_loss,
+            "val_loss": avg_val_loss,
+            "val_acc": val_acc
+        })
+
+        # Build a simple table of the latest epoch metrics
+        table_data = [
+            ["Epoch", "Avg Train Loss", "Avg Val Loss", "Val Pixel Acc"]
+        ]
+        last = history[-1]
+        table_data.append([
+            str(last["epoch"]),
+            f"{last['train_loss']:.4f}",
+            f"{last['val_loss']:.4f}",
+            f"{last['val_acc'] * 100:.2f}%"
+        ])
+        print(AsciiTable(table_data).table)
+
+        # -------------------------------
+        # 10) Checkpoint
+        # -------------------------------
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            ckpt = {
+                "epoch": last["epoch"],
+                "backbone_state_dict": backbone.module.state_dict() if num_visible > 1 else backbone.state_dict(),
+                "aspp_head_state_dict": aspp_head.module.state_dict() if num_visible > 1 else aspp_head.state_dict(),
+                "aux_head_state_dict": aux_head.module.state_dict() if num_visible > 1 else aux_head.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "config": cfg
+            }
+            os.makedirs(cfg["output"]["checkpoint_dir"], exist_ok=True)
+            save_path = os.path.join(
+                cfg["output"]["checkpoint_dir"],
+                f"{cfg['output']['project_name']}epoch_{epoch}_best.pth"
+            )
+            torch.save(ckpt, save_path)
+            print(f"→ Saved new best model to {save_path}\n")
+
+    print("Training complete.")
+
+    # =============================================================================
+    # 11) Final per-class accuracy on validation set (fine-level classes only)
+    # =============================================================================
+    print("\n## Computing per-fine-class pixel accuracy on val set ...\n")
     backbone.eval()
     aspp_head.eval()
 
-    # 5) Load checkpoint (either CLI or config default)
-    if args.checkpoint:
-        ckpt_path = args.checkpoint
-    else:
-        ckpt_dir     = cfg["output"]["checkpoint_dir"]
-        project_name = cfg["output"]["project_name"]
-        ckpt_path    = os.path.join(ckpt_dir, f"{project_name}_best.pth")
+    per_class_correct = torch.zeros(n_fine, dtype=torch.long, device=device)
+    per_class_total   = torch.zeros(n_fine, dtype=torch.long, device=device)
 
-    if not os.path.isfile(ckpt_path):
-        raise FileNotFoundError(f"No checkpoint found at {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location=device)
-    backbone.load_state_dict(ckpt["backbone_state_dict"])
-    aspp_head.load_state_dict(ckpt["aspp_head_state_dict"])
-
-    # 6) Preprocess input image
-    resize_cfg = cfg.get("transform", {}).get("resize", None)
-    if resize_cfg is not None:
-        resize = (int(resize_cfg[0]), int(resize_cfg[1]))
-    else:
-        resize = None
-
-    img_t, (orig_H, orig_W), (proc_H, proc_W), orig_pil = preprocess_image(args.image, resize)
-    img_t = img_t.to(device)
-
-    # 7) Forward pass
     with torch.no_grad():
-        c1, c2, c3, c4 = backbone(img_t)
-        logits, _     = aspp_head([c1, c2, c3, c4])
-        # logits: [1, total_classes, H/4, W/4]
+        for batch in tqdm(val_loader, desc="Final eval on val set"):
+            img_t     = batch[0].to(device, non_blocking=True)
+            fine_mask = batch[1].to(device, non_blocking=True)  # [B, H, W]
 
-        # Upsample logits to original size
-        logits_full = F.interpolate(
-            logits, size=(orig_H, orig_W), mode="bilinear", align_corners=False
-        )  # [1, total_classes, orig_H, orig_W]
+            c1, c2, c3, c4 = backbone(img_t)
+            logits, _ = aspp_head([c1, c2, c3, c4])
 
-        # Split into fine / coarse / super channels
-        fine_logits   = logits_full[:, :n_fine, :, :]                        # [1, n_fine, H, W]
-        coarse_logits = logits_full[:, n_fine : n_fine + n_coarse, :, :]      # [1, n_coarse, H, W]
-        if has_super:
-            super_logits = logits_full[:, n_fine + n_coarse :, :, :]          # [1, n_super, H, W]
+            B, _, H4, W4 = logits.shape
+            H, W = fine_mask.shape[-2:]
 
-        # Compute argmax
-        fine_pred   = fine_logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int32)    # [H, W]
-        coarse_pred = coarse_logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int32)
-        if has_super:
-            super_pred = super_logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.int32)
+            logit_full = nn.functional.interpolate(
+                logits, size=(H, W), mode="bilinear", align_corners=False
+            )  # [B, total_classes, H, W]
 
-    # 8) Save raw masks and colored overlays
-    os.makedirs(args.output_dir, exist_ok=True)
-    base_name = os.path.splitext(os.path.basename(args.image))[0]
+            fine_logits = logit_full[:, :n_fine, :, :]  # [B, n_fine, H, W]
+            fine_pred   = fine_logits.argmax(dim=1)     # [B, H, W]
 
-    # a) Raw masks (grayscale class indices)
-    fine_out_path   = os.path.join(args.output_dir, f"{base_name}_fine.png")
-    save_mask(fine_pred, fine_out_path)
-    coarse_out_path = os.path.join(args.output_dir, f"{base_name}_coarse.png")
-    save_mask(coarse_pred, coarse_out_path)
-    if has_super:
-        super_out_path = os.path.join(args.output_dir, f"{base_name}_super.png")
-        save_mask(super_pred, super_out_path)
+            for i in range(n_fine):
+                mask_i = (fine_mask == i)
+                per_class_total[i] += mask_i.sum().item()
+                per_class_correct[i] += ((fine_pred == i) & mask_i).sum().item()
 
-    print(f"→ Saved fine‐level mask to {fine_out_path}")
-    print(f"→ Saved coarse‐level mask to {coarse_out_path}")
-    if has_super:
-        print(f"→ Saved super‐level mask to {super_out_path}")
+    table_data = [["Class ID", "Class Name", "Pixel Acc (%)"]]
+    fine_names = cfg["classes"]["fine_names"]
+    for i in range(n_fine):
+        total_i   = per_class_total[i].item()
+        correct_i = per_class_correct[i].item()
+        acc_i = 100.0 * correct_i / total_i if total_i > 0 else 0.0
+        class_name = fine_names[i]
+        table_data.append([str(i), class_name, f"{acc_i:.2f}"])
 
-    # b) Solid‐color masks with class indices drawn at centroids
-    cmap_fine    = create_colormap(n_fine)
-    color_fine   = mask_to_color_image(fine_pred, cmap_fine)
-    color_fine   = draw_class_indices(fine_pred, color_fine)
-    fine_color_path = os.path.join(args.output_dir, f"{base_name}_fine_color.png")
-    color_fine.save(fine_color_path)
-    print(f"→ Saved fine‐level color mask + indices to {fine_color_path}")
-
-    cmap_coarse    = create_colormap(n_coarse)
-    color_coarse   = mask_to_color_image(coarse_pred, cmap_coarse)
-    color_coarse   = draw_class_indices(coarse_pred, color_coarse)
-    coarse_color_path = os.path.join(args.output_dir, f"{base_name}_coarse_color.png")
-    color_coarse.save(coarse_color_path)
-    print(f"→ Saved coarse‐level color mask + indices to {coarse_color_path}")
-
-    if has_super:
-        cmap_super    = create_colormap(n_super)
-        color_super   = mask_to_color_image(super_pred, cmap_super)
-        color_super   = draw_class_indices(super_pred, color_super)
-        super_color_path = os.path.join(args.output_dir, f"{base_name}_super_color.png")
-        color_super.save(super_color_path)
-        print(f"→ Saved super‐level color mask + indices to {super_color_path}")
-
-    print("Inference complete.")
+    print(AsciiTable(table_data).table)
 
 
 if __name__ == "__main__":
