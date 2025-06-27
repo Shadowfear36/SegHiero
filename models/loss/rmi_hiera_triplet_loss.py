@@ -1,11 +1,11 @@
-# file: models/loss/rmi_hiera_triplet_loss.py
+# file: models/loss/enhanced_rmi_hiera_triplet_loss.py
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 from .cross_entropy_loss import CrossEntropyLoss
-from .rmi_tree_triplet_loss import TreeTripletLoss
+from .enhanced_rmi_tree_triplet_loss import TreeTripletLoss
 
 # =============================================================================
 # Helpers for 3‐level hierarchy (fine → mid → high)
@@ -49,7 +49,7 @@ def _prepare_targets_three_level(
     # Copy the fine‐level map; we'll fill mid/high next
     targets_fine = targets
 
-    # Initialize mid/high maps to “ignore” (255)
+    # Initialize mid/high maps to "ignore" (255)
     targets_mid  = torch.full((b, H, W), 255, dtype=dtype, device=device)
     targets_high = torch.full((b, H, W), 255, dtype=dtype, device=device)
 
@@ -64,16 +64,18 @@ def _prepare_targets_three_level(
 
 
 # =============================================================================
-# RMIHieraTripletLoss
+# Enhanced RMIHieraTripletLoss with Super -> Coarse relationship
 # =============================================================================
-class RMIHieraTripletLoss(nn.Module):
+class EnhancedRMIHieraTripletLoss(nn.Module):
     """
-    3‐level (fine → mid → high) hierarchical RMI + triplet loss, fully configurable.
+    Enhanced 3‐level (fine → mid → high) hierarchical RMI + triplet loss 
+    that explicitly learns Super -> Coarse relationships.
 
     Constructor arguments:
       • n_fine, n_mid, n_high: ints
       • fine_to_mid:   LongTensor of length = n_fine, mapping each fine‐ID→mid‐ID
       • fine_to_high:  LongTensor of length = n_fine, mapping each fine‐ID→high‐ID
+      • mid_to_high:   LongTensor of length = n_mid, mapping each mid‐ID→high‐ID
       • rmi_radius, rmi_pool_way, rmi_pool_size, rmi_pool_stride: as before
       • loss_weight_lambda: weight on the RMI term vs. BCE term
       • loss_weight: global scale (multiplies entire loss at the end)
@@ -95,26 +97,32 @@ class RMIHieraTripletLoss(nn.Module):
                  n_high: int,
                  fine_to_mid: torch.Tensor,
                  fine_to_high: torch.Tensor,
+                 mid_to_high: torch.Tensor,  # NEW: explicit mid->high mapping
                  rmi_radius: int      = 3,
                  rmi_pool_way: int    = 0,
                  rmi_pool_size: int   = 3,
                  rmi_pool_stride: int = 3,
                  loss_weight_lambda: float = 0.5,
                  loss_weight: float   = 1.0,
-                 ignore_index: int    = 255):
+                 ignore_index: int    = 255,
+                 super_coarse_weight: float = 1.0):  # NEW: weight for super->coarse loss
         super().__init__()
 
         assert fine_to_mid.dtype == torch.long
         assert fine_to_high.dtype == torch.long
+        assert mid_to_high.dtype == torch.long
         assert fine_to_mid.numel() == n_fine
         assert fine_to_high.numel() == n_fine
+        assert mid_to_high.numel() == n_mid
 
         self.n_fine  = n_fine
         self.n_mid   = n_mid
         self.n_high  = n_high
         self.fine_to_mid  = fine_to_mid.clone()
         self.fine_to_high = fine_to_high.clone()
+        self.mid_to_high  = mid_to_high.clone()  # NEW
         self.ignore_index = ignore_index
+        self.super_coarse_weight = super_coarse_weight  # NEW
 
         # RMI‐specific params
         self.rmi_radius    = rmi_radius
@@ -132,11 +140,11 @@ class RMIHieraTripletLoss(nn.Module):
         # Plain CrossEntropy on fine/mid/high slices:
         self.ce = CrossEntropyLoss()
 
-        # Triplet‐loss on the “embedding”:
-        # We now pass both mapping vectors so TreeTripletLoss knows fine→mid and fine→high
+        # Triplet‐loss on the "embedding":
         self.triplet_loss = TreeTripletLoss(
             fine_to_mid  = self.fine_to_mid,
             fine_to_high = self.fine_to_high,
+            mid_to_high  = self.mid_to_high,  # ADD THIS LINE
             ignore_index = self.ignore_index
         )
 
@@ -166,18 +174,11 @@ class RMIHieraTripletLoss(nn.Module):
             pr_vectors = torch.stack(pr_ns, dim=2)
             return la_vectors, pr_vectors
 
-    # -------------------------------------------------------------------------
-    # Replace `torch.cholesky` with `torch.linalg.cholesky` and add jitter logic.
-    # -------------------------------------------------------------------------
     def log_det_by_cholesky(self, matrix: torch.Tensor):
         """
         Compute log‐det(matrix) via Cholesky, but if Cholesky fails,
         add gradually larger jitter = alpha * I until PD. If still fails,
         fallback to slogdet.
-        Input:
-          - matrix: [..., d, d] symmetric (should be positive‐definite)
-        Returns:
-          - log_det: [...], i.e. log |matrix|
         """
         # Ensure exact symmetry (small numerical noise can violate it):
         mat = 0.5 * (matrix + matrix.transpose(-2, -1))
@@ -198,11 +199,80 @@ class RMIHieraTripletLoss(nn.Module):
             except RuntimeError:
                 jitter *= 10.0
 
-        # If we still can’t Cholesky‐factorize, fall back to slogdet:
+        # If we still can't Cholesky‐factorize, fall back to slogdet:
         mat_pd = mat + jitter * identity
         sign, ld = torch.linalg.slogdet(mat_pd)
         # slogdet may return negative sign if still not PD; assume sign>0 and take ld
         return ld
+
+    def compute_super_coarse_consistency_loss(self, probs, targets_mid, targets_high):
+        """
+        NEW: Compute consistency loss between Super and Coarse levels.
+        
+        Args:
+            probs: [B, n_fine + n_mid + n_high, H, W] - sigmoid probabilities
+            targets_mid: [B, H, W] - coarse level targets
+            targets_high: [B, H, W] - super level targets
+            
+        Returns:
+            super_coarse_loss: scalar tensor
+        """
+        b, _, H, W = probs.shape
+        device = probs.device
+        
+        # Extract mid and high probabilities
+        prob_mid = probs[:, self.n_fine : self.n_fine + self.n_mid, :, :]    # [B, n_mid, H, W]
+        prob_high = probs[:, self.n_fine + self.n_mid :, :, :]               # [B, n_high, H, W]
+        
+        # Valid masks
+        valid_mid = (targets_mid != self.ignore_index)   # [B, H, W]
+        valid_high = (targets_high != self.ignore_index) # [B, H, W]
+        valid_both = valid_mid & valid_high              # [B, H, W]
+        
+        if not valid_both.any():
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        super_coarse_loss = 0.0
+        loss_count = 0
+        
+        # For each super class, enforce consistency with its coarse children
+        for high_idx in range(self.n_high):
+            # Find which coarse classes belong to this super class
+            coarse_children = (self.mid_to_high == high_idx).nonzero(as_tuple=False).flatten()
+            
+            if len(coarse_children) == 0:
+                continue
+                
+            # Mask for pixels that should be this super class
+            super_mask = (targets_high == high_idx) & valid_both  # [B, H, W]
+            
+            if not super_mask.any():
+                continue
+            
+            # Get the predicted probability for this super class
+            pred_super = prob_high[:, high_idx, :, :]  # [B, H, W]
+            
+            # Get the maximum probability among coarse children for this super class
+            coarse_probs_children = prob_mid[:, coarse_children, :, :]  # [B, len(coarse_children), H, W]
+            max_coarse_prob = coarse_probs_children.max(dim=1)[0]  # [B, H, W]
+            
+            # Consistency constraint: super probability should be >= max(coarse children)
+            # Loss = max(0, max_coarse - super + margin)
+            margin = 0.1
+            consistency_loss = F.relu(max_coarse_prob - pred_super + margin)
+            
+            # Apply mask and compute mean
+            masked_loss = consistency_loss * super_mask.float()
+            if super_mask.sum() > 0:
+                super_coarse_loss += masked_loss.sum() / super_mask.sum().float()
+                loss_count += 1
+        
+        if loss_count > 0:
+            super_coarse_loss = super_coarse_loss / loss_count
+        else:
+            super_coarse_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            
+        return super_coarse_loss
 
     def forward(self,
                 step: torch.Tensor,
@@ -213,14 +283,8 @@ class RMIHieraTripletLoss(nn.Module):
                 weight=None,
                 **kwargs):
         """
-        Input shapes:
-          • step:             scalar Tensor (used for scheduling triplet weight)
-          • embedding:        [B, D, H/8, W/8]
-          • cls_score_before: [B, n_fine, H/8, W/8]  (triplet only)
-          • cls_score:        [B, n_fine+n_mid+n_high, H, W]
-          • label:            [B, H, W]  (fine IDs or 255=ignore)
+        Enhanced forward pass with Super -> Coarse consistency loss.
         """
-
         b, H, W = label.shape
 
         # 1) Build three‐level targets (fine, mid, high) from the single fine mask:
@@ -228,7 +292,7 @@ class RMIHieraTripletLoss(nn.Module):
             label, self.fine_to_mid, self.fine_to_high
         )
 
-        # 2) Compute the three‐level “hierarchical” loss:
+        # 2) Compute the three‐level "hierarchical" loss:
         predictions = cls_score  # alias
         probs = torch.sigmoid(predictions.float())
 
@@ -285,7 +349,7 @@ class RMIHieraTripletLoss(nn.Module):
             else:
                 MCMC_combined[:, j : j+1, :, :] = MCMC[:, j : j+1, :, :]
 
-        # Build MCLB, MCLC for the “B” side of mid/high as in original code:
+        # Build MCLB, MCLC for the "B" side of mid/high as in original code:
         MCLB = probs[:, self.n_fine : self.n_fine + self.n_mid, :, :]   # [B, n_mid, H,W]
         MCLC = probs[:, self.n_fine + self.n_mid : self.n_fine + self.n_mid + self.n_high, :, :]  # [B, n_high, H, W]
 
@@ -313,7 +377,7 @@ class RMIHieraTripletLoss(nn.Module):
             else:
                 MCLB_combined[:, m : m + 1, :, :] = MCLB[:, m : m + 1, :, :]
 
-        # Now compute the three‐level “hiera‐focal‐like” BCE losses:
+        # Now compute the three‐level "hiera‐focal‐like" BCE losses:
         valid_f = (~void_f).unsqueeze(1).float()   # [B,1,H,W]
         num_valid_f = valid_f.sum().clamp_min(1.0)
         valid_m = (~void_m).unsqueeze(1).float()
@@ -340,6 +404,10 @@ class RMIHieraTripletLoss(nn.Module):
         ).sum() / (num_valid_h * self.n_high)
 
         hiera_loss = 5.0 * (loss_f + loss_m + loss_h)
+
+        # NEW: Add Super -> Coarse consistency loss
+        super_coarse_loss = self.compute_super_coarse_consistency_loss(probs, targets_mid, targets_high)
+        hiera_loss = hiera_loss + self.super_coarse_weight * super_coarse_loss
 
         # ---------------------------------------------------------------------
         # 3) RMI‐lower‐bound term on Sigmoid‐probabilities
@@ -373,7 +441,7 @@ class RMIHieraTripletLoss(nn.Module):
         rmi_now = 0.5 * self.log_det_by_cholesky(approx_var + diag_eye * _POS_ALPHA)
         rmi_per_class = rmi_now.view([-1, self.n_fine + self.n_mid + self.n_high]).mean(dim=0).float()
         rmi_per_class = rmi_per_class / float(self.half_d)
-        rmi_loss = torch.sum(rmi_per_class)
+        rmi_loss = -torch.sum(rmi_per_class)
 
         # Combine RMI with hiera‐loss
         final_loss = self.loss_weight_lambda * rmi_loss + 0.5 * hiera_loss
@@ -387,7 +455,7 @@ class RMIHieraTripletLoss(nn.Module):
         final_loss = final_loss + ce_f + ce_m + ce_h
 
         # ---------------------------------------------------------------------
-        # 5) Add the triplet term on “embedding”
+        # 5) Add the triplet term on "embedding"
         # ---------------------------------------------------------------------
         loss_triplet, class_count = self.triplet_loss(embedding, label)
         if torch.distributed.is_initialized():

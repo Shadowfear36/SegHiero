@@ -7,16 +7,19 @@ import torch.nn.functional as F
 class TreeTripletLoss(nn.Module):
     """
     Tree‐structured triplet loss for a 3‐level hierarchy (fine→mid→high).
+    Now includes Super → Coarse relationship learning.
 
     Constructor arguments:
       • fine_to_mid:   LongTensor of length = n_fine, mapping each fine‐ID→mid‐ID
       • fine_to_high:  LongTensor of length = n_fine, mapping each fine‐ID→high‐ID
+      • mid_to_high:   LongTensor of length = n_mid, mapping each mid‐ID→high‐ID
       • ignore_index:  label to ignore (default = 255)
     """
 
     def __init__(self,
                  fine_to_mid: torch.Tensor,
                  fine_to_high: torch.Tensor,
+                 mid_to_high: torch.Tensor,
                  ignore_index: int = 255):
         super().__init__()
         self.ignore_label = ignore_index
@@ -24,11 +27,15 @@ class TreeTripletLoss(nn.Module):
         # Store the mapping vectors as buffers so they follow .to(device)
         assert fine_to_mid.dtype == torch.long
         assert fine_to_high.dtype == torch.long
+        assert mid_to_high.dtype == torch.long
         self.register_buffer('fine_to_mid',  fine_to_mid.clone())
         self.register_buffer('fine_to_high', fine_to_high.clone())
+        self.register_buffer('mid_to_high',  mid_to_high.clone())
 
     def forward(self, feats: torch.Tensor, labels: torch.Tensor, max_triplet: int = 200):
         """
+        Enhanced forward pass that learns hierarchical relationships at all levels.
+        
         feats:   [B, D, H_feat, W_feat]  (embedding to form triplets)
         labels:  [B, H_label, W_label]    (fine‐level ground truth in [0..n_fine−1] or ignore_index)
         """
@@ -56,7 +63,45 @@ class TreeTripletLoss(nn.Module):
             mid_ids_all[valid_mask]  = self.fine_to_mid[valid_labels]
             high_ids_all[valid_mask] = self.fine_to_high[valid_labels]
 
-        # 4) Collect existing fine‐classes (exclude ignore and background = 0)
+        # 4) Compute triplet losses at multiple levels
+        total_triplet_loss = 0.0
+        total_class_count = 0
+
+        # Level 1: Fine-level triplets (original logic)
+        fine_loss, fine_count = self._compute_fine_level_triplets(
+            flat_labels, flat_feats, mid_ids_all, high_ids_all, max_triplet, device
+        )
+        if fine_loss is not None:
+            total_triplet_loss += fine_loss
+            total_class_count += fine_count
+
+        # Level 2: Mid-level triplets (NEW: Super-Coarse relationships)
+        mid_loss, mid_count = self._compute_mid_level_triplets(
+            flat_labels, flat_feats, mid_ids_all, high_ids_all, max_triplet, device
+        )
+        if mid_loss is not None:
+            # Weight the mid-level loss slightly less than fine-level
+            total_triplet_loss += 0.7 * mid_loss
+            total_class_count += mid_count
+
+        if total_class_count == 0:
+            # No valid triplets across batch
+            return None, torch.tensor([0], device=device)
+
+        # Average the losses
+        total_triplet_loss = total_triplet_loss / total_class_count
+        return total_triplet_loss, torch.tensor([total_class_count], device=device)
+
+    def _compute_fine_level_triplets(self, flat_labels, flat_feats, mid_ids_all, high_ids_all, max_triplet, device):
+        """
+        Compute triplets for fine-level classes (original logic).
+        
+        For each fine class:
+        - Anchor: pixels of this fine class
+        - Positive: pixels of other fine classes in the same coarse class
+        - Negative: pixels of fine classes in different super classes
+        """
+        # Collect existing fine‐classes (exclude ignore and background = 0)
         unique_labels = flat_labels.unique()
         exist_classes = [c.item() for c in unique_labels if (c.item() != self.ignore_label and c.item() != 0)]
 
@@ -108,8 +153,80 @@ class TreeTripletLoss(nn.Module):
                 class_count += 1
 
         if class_count == 0:
-            # No valid triplets across batch
-            return None, torch.tensor([0], device=device)
+            return None, 0
 
-        triplet_loss = triplet_loss / class_count
-        return triplet_loss, torch.tensor([class_count], device=device)
+        return triplet_loss / class_count, class_count
+
+    def _compute_mid_level_triplets(self, flat_labels, flat_feats, mid_ids_all, high_ids_all, max_triplet, device):
+        """
+        NEW: Compute triplets for mid-level (coarse) classes to learn Super → Coarse relationships.
+        
+        For each coarse class:
+        - Anchor: pixels of this coarse class
+        - Positive: pixels of other coarse classes in the same super class
+        - Negative: pixels of coarse classes in different super classes
+        """
+        # Collect existing mid‐classes (exclude -1 which is invalid)
+        unique_mids = mid_ids_all.unique()
+        exist_mids = [c.item() for c in unique_mids if c.item() != -1]
+
+        triplet_loss = 0.0
+        class_count = 0
+
+        for mid_cls in exist_mids:
+            # anchor mask for this mid class
+            anchor_mask = (mid_ids_all == mid_cls)
+
+            # Find which super class this mid belongs to
+            super_id = self.mid_to_high[mid_cls].item()
+
+            # Positive mask: same super but different mid, and not ignore
+            # We need to find other mid classes that belong to the same super class
+            pos_mask = torch.zeros_like(flat_labels, dtype=torch.bool)
+            for other_mid in exist_mids:
+                if other_mid != mid_cls and self.mid_to_high[other_mid].item() == super_id:
+                    pos_mask |= (mid_ids_all == other_mid)
+            pos_mask &= (flat_labels != self.ignore_label)
+
+            # Negative mask: different super, and not ignore
+            neg_mask = torch.zeros_like(flat_labels, dtype=torch.bool)
+            for other_mid in exist_mids:
+                if self.mid_to_high[other_mid].item() != super_id:
+                    neg_mask |= (mid_ids_all == other_mid)
+            neg_mask &= (flat_labels != self.ignore_label)
+
+            # Count available samples
+            num_anchor = int(anchor_mask.sum().item())
+            num_pos    = int(pos_mask.sum().item())
+            num_neg    = int(neg_mask.sum().item())
+
+            if num_anchor == 0 or num_pos == 0 or num_neg == 0:
+                continue  # cannot form triplet for this class
+
+            # Determine how many triplets to sample
+            min_size = min(num_anchor, num_pos, num_neg, max_triplet)
+
+            # Gather embeddings
+            feats_anchor = flat_feats[anchor_mask][:min_size]  # [min_size, D]
+            feats_pos    = flat_feats[pos_mask][:min_size]     # [min_size, D]
+            feats_neg    = flat_feats[neg_mask][:min_size]     # [min_size, D]
+
+            # Compute cosine‐based distances: 1 − (a⋅b)
+            dist_pos = 1.0 - (feats_anchor * feats_pos).sum(dim=1)
+            dist_neg = 1.0 - (feats_anchor * feats_neg).sum(dim=1)
+
+            # Smaller margin for mid-level (coarser granularity)
+            margin = 0.4 * torch.ones(min_size, device=device)
+
+            # Triplet margin loss: max(0, d_pos − d_neg + margin)
+            tl = dist_pos - dist_neg + margin
+            tl = F.relu(tl)
+
+            if tl.numel() > 0:
+                triplet_loss += tl.mean()
+                class_count += 1
+
+        if class_count == 0:
+            return None, 0
+
+        return triplet_loss / class_count, class_count

@@ -18,7 +18,8 @@ from models.head.sep_aspp_contrast_head import DepthwiseSeparableASPPContrastHea
 
 # Two versions of the loss, one for 2-level and one for 3-level
 from models.loss.hiera_triplet_loss import HieraTripletLoss
-from models.loss.rmi_hiera_triplet_loss import RMIHieraTripletLoss
+from models.loss.enhanced_rmi_hiera_triplet_loss import EnhancedRMIHieraTripletLoss
+from dataset.augmentations import ProductionJointTransform
 
 
 def parse_args():
@@ -36,6 +37,23 @@ def parse_args():
         type=str,
         default=None,
         help="Path to a pretrained checkpoint (.pth) to initialize the model (optional)",
+    )
+    parser.add_argument(
+        "--use_production_aug",
+        action="store_true",
+        help="Enable production augmentations for robustness training"
+    )
+    parser.add_argument(
+        "--aug_strength",
+        type=float,
+        default=1.0,
+        help="Strength of production augmentations (0.0-1.0)"
+    )
+    parser.add_argument(
+        "--aug_prob",
+        type=float,
+        default=0.4,
+        help="Probability of applying production augmentations to each image"
     )
     return parser.parse_args()
 
@@ -71,6 +89,16 @@ def build_fine_to_coarse_map(coarse_to_fine_cfg: list, n_fine: int) -> torch.Ten
                 mapping[f] = coarse_idx
     return mapping
 
+def build_coarse_to_super_map(super_to_coarse_cfg: list, n_coarse: int) -> torch.Tensor:
+    mapping = torch.empty(n_coarse, dtype=torch.long)
+    for super_idx, sub in enumerate(super_to_coarse_cfg):
+        if len(sub) == 1:
+            mapping[int(sub[0])] = super_idx
+        else:
+            for c in range(int(sub[0]), int(sub[1]) + 1):
+                mapping[c] = super_idx
+    return mapping
+
 
 def build_hiera_index(coarse_to_fine_cfg: list) -> list:
     """
@@ -89,12 +117,12 @@ def build_hiera_index(coarse_to_fine_cfg: list) -> list:
     return hiera_index
 
 
-def build_fine_to_super_map(super_to_coarse_cfg: list, n_fine: int) -> torch.Tensor:
+def build_fine_to_super_map(super_to_fine_cfg: list, n_fine: int) -> torch.Tensor:
     """
-    Similar to build_fine_to_coarse_map, but for “super_coarse_to_coarse_map”.
+    Similar to build_fine_to_coarse_map, but for “super_coarse_to_fine_map”.
     """
     mapping = torch.empty(n_fine, dtype=torch.long)
-    for super_idx, sub in enumerate(super_to_coarse_cfg):
+    for super_idx, sub in enumerate(super_to_fine_cfg):
         if len(sub) == 1:
             lbl = int(sub[0])
             mapping[lbl] = super_idx
@@ -112,7 +140,7 @@ def main():
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
 
-    # 1.1) If user supplied a “gpus” list, set CUDA_VISIBLE_DEVICES accordingly
+    # 1.1) If user supplied a "gpus" list, set CUDA_VISIBLE_DEVICES accordingly
     if "gpus" in cfg["training"]:
         gpu_list = cfg["training"]["gpus"]
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(x) for x in gpu_list)
@@ -123,9 +151,31 @@ def main():
     num_visible = torch.cuda.device_count()
     print(f"[DEBUG] torch.cuda.device_count() = {num_visible}, torch.cuda.current_device() = {torch.cuda.current_device()}")
 
-    # 2) Build Datasets + DataLoaders
-    train_ds = HieroDataloader(args.config, split="train")
-    val_ds   = HieroDataloader(args.config, split="val")
+    # 2) Build Datasets + DataLoaders with optional production augmentations
+    if args.use_production_aug:
+        print(f"→ Using production augmentations (strength={args.aug_strength}, prob={args.aug_prob})")
+        
+        # Get resize settings from config if available
+        tf_cfg = cfg.get('transform', {})
+        resize = None
+        if tf_cfg.get('resize') is not None:
+            resize = (int(tf_cfg['resize'][0]), int(tf_cfg['resize'][1]))
+        hflip_prob = float(tf_cfg.get('hflip_prob', 0.5))
+        
+        # Create production transform
+        production_transform = ProductionJointTransform(
+            resize=resize,
+            hflip_prob=hflip_prob,
+            production_aug_prob=args.aug_prob,
+            augmentation_strength=args.aug_strength
+        )
+        
+        train_ds = HieroDataloader(args.config, split="train", transform=production_transform)
+    else:
+        train_ds = HieroDataloader(args.config, split="train")  # Uses default transform
+    
+    # Validation dataset always uses default transform (no production augmentations)
+    val_ds = HieroDataloader(args.config, split="val")
 
     train_loader = DataLoader(
         train_ds,
@@ -206,17 +256,17 @@ def main():
         aspp_state     = _strip_module(ckpt["aspp_head_state_dict"])
         aux_state      = _strip_module(ckpt["aux_head_state_dict"])
 
-        backbone.load_state_dict(backbone_state)
-        aspp_head.load_state_dict(aspp_state)
-        aux_head.load_state_dict(aux_state)
+        backbone.load_state_dict(backbone_state, strict=False)
+        aspp_head.load_state_dict(aspp_state, strict=False)
+        aux_head.load_state_dict(aux_state, strict=False)
         print("→ Pretrained weights successfully loaded (backbone + heads)")
 
     # 5) Build Loss function (either 2-level or 3-level)
     if not has_super:
         # ────────────────────────────────────────────────────────
         # 2-level case:
-        #   - build “fine→coarse” mapping (as a Python list) from YAML
-        #   - build “hiera_index” list so that HieraTripletLoss can consume it
+        #   - build "fine→coarse" mapping (as a Python list) from YAML
+        #   - build "hiera_index" list so that HieraTripletLoss can consume it
         # ────────────────────────────────────────────────────────
         coarse_to_fine_cfg = cfg["classes"]["coarse_to_fine_map"]
 
@@ -226,7 +276,7 @@ def main():
         # Build hiera_index = [[start,end+1],...] exactly as HieraTripletLoss expects
         hiera_index = build_hiera_index(coarse_to_fine_cfg)
 
-        # Convert “fine_to_coarse” to a plain Python list for HieraTripletLoss
+        # Convert "fine_to_coarse" to a plain Python list for HieraTripletLoss
         hiera_map_list = fine_to_coarse.tolist()
 
         hiera_loss_fn = HieraTripletLoss(
@@ -248,28 +298,34 @@ def main():
         #   - supply n_fine, n_mid, n_high, plus the two mapping-tensors
         # ────────────────────────────────────────────────────────
         coarse_to_fine_cfg  = cfg["classes"]["coarse_to_fine_map"]
-        super_to_coarse_cfg = cfg["classes"]["super_coarse_to_coarse_map"]
+        super_to_fine_cfg = cfg["classes"]["super_coarse_to_fine_map"]
+        super_to_coarse_cfg = cfg['classes']["super_coarse_to_coarse_map"]
 
         # 1) fine→mid
         fine_to_mid = build_fine_to_coarse_map(coarse_to_fine_cfg, n_fine)
 
         # 2) fine→high
-        fine_to_high = build_fine_to_super_map(super_to_coarse_cfg, n_fine)
+        fine_to_high = build_fine_to_super_map(super_to_fine_cfg, n_fine)
+
+        # 3) coarse→high
+        mid_to_high = build_coarse_to_super_map(super_to_coarse_cfg, n_coarse)
 
         n_mid  = n_coarse
         n_high = n_super
 
-        hiera_loss_fn = RMIHieraTripletLoss(
+        hiera_loss_fn = EnhancedRMIHieraTripletLoss(
             n_fine            = n_fine,
             n_mid             = n_mid,
             n_high            = n_high,
             fine_to_mid       = fine_to_mid,
             fine_to_high      = fine_to_high,
+            mid_to_high       = mid_to_high,
             rmi_radius        = cfg["training"].get("rmi_radius", 3),
             rmi_pool_way      = cfg["training"].get("rmi_pool_way", 0),
             rmi_pool_size     = cfg["training"].get("rmi_pool_size", 3),
             rmi_pool_stride   = cfg["training"].get("rmi_pool_stride", 3),
             loss_weight_lambda= cfg["training"].get("fine_weight", 1.0),
+            super_coarse_weight = cfg["training"].get("super_weight", 1.0),
             loss_weight       = 1.0,
             ignore_index      = 255,
         ).to(device)

@@ -7,6 +7,7 @@ dataset:
       image_subdir: '/subdir'
       mask_subdir: '/subdir'
 classes:
+    super_coarse_to_fine_map: [[0,7], [8]]
     super_coarse_to_coarse_map: [[0, 2], [3]]
     super_coarse_names:
       0: Plant
@@ -41,6 +42,10 @@ training:
   super_weight:   1.0 
   num_workers:  1
   gpus: [0]
+  rmi_radius: 3
+  rmi_pool_way: 0
+  rmi_pool_size: 3
+  rmi_pool_stride: 3
 
 transform:
   resize: [150, 150]
