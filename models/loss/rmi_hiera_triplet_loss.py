@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from .cross_entropy_loss import CrossEntropyLoss
-from .enhanced_rmi_tree_triplet_loss import TreeTripletLoss
+from .rmi_tree_triplet_loss import TreeTripletLoss
 
 # =============================================================================
 # Helpers for 3‐level hierarchy (fine → mid → high)

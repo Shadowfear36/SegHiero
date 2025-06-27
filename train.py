@@ -18,7 +18,7 @@ from models.head.sep_aspp_contrast_head import DepthwiseSeparableASPPContrastHea
 
 # Two versions of the loss, one for 2-level and one for 3-level
 from models.loss.hiera_triplet_loss import HieraTripletLoss
-from models.loss.enhanced_rmi_hiera_triplet_loss import EnhancedRMIHieraTripletLoss
+from models.loss.rmi_hiera_triplet_loss import EnhancedRMIHieraTripletLoss
 from dataset.augmentations import ProductionJointTransform
 
 
