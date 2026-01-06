@@ -1,0 +1,8 @@
+numpy
+torch
+torchvision
+terminaltables
+tqdm
+pyyaml
+pillow
+numpy
