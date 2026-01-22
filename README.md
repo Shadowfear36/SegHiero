@@ -107,10 +107,6 @@ SegHiero/
 ├── infer.py                           # Inference script
 ├── example-config.yaml                # Example config with all architectures
 ├── requirements.txt                   # Dependencies
-├── tools/
-│   ├── coco_to_seghiero.py            # COCO converter script (NEW)
-│   ├── coco_mapping_example.yaml      # Example COCO mapping (NEW)
-│   └── README.md                      # Tools documentation (NEW)
 ├── ARCHITECTURE_INTEGRATION_GUIDE.md  # Comprehensive architecture guide (NEW)
 ├── CONFIG_EXAMPLES.md                 # Quick config examples (NEW)
 ├── DATASET_PREPARATION_GUIDE.md       # Dataset creation guide (NEW)
@@ -200,7 +196,6 @@ root/
 - Fine-level masks use integer labels in `[0..n_fine−1]` and `255` for "ignore" pixels
 - The hierarchical grouping (fine → coarse → super) is defined in your config file, not in the masks
 - See [DATASET_PREPARATION_GUIDE.md](DATASET_PREPARATION_GUIDE.md) for detailed instructions on creating masks, defining hierarchies, and troubleshooting
-- See [tools/](tools/) for conversion scripts (COCO, Cityscapes, etc.)
 
 ---
 
