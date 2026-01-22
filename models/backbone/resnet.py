@@ -38,10 +38,6 @@ class ResNetBackbone(nn.Module):
         else:
             raise ValueError("`depth` must be 50 or 101")
 
-        # 1) Remove avgpool & fully‐connected
-        #    (“base” is a nn.Module with attributes: conv1, bn1, relu, maxpool,
-        #     layer1, layer2, layer3, layer4, avgpool, fc)
-        #    We will keep everything up through layer4.
         self.stem_conv  = base.conv1    # 7×7, stride=2, padding=3
         self.stem_bn    = base.bn1
         self.stem_relu  = base.relu

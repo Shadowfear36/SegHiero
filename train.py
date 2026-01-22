@@ -12,13 +12,133 @@ from terminaltables import AsciiTable
 
 from dataset.dataloader import HieroDataloader
 
-# Replace these with your actual import paths:
+# Backbone imports
 from models.backbone.resnet import ResNetBackbone
+from models.backbone.convnext import ConvNeXtBackbone
+from models.backbone.segformer import SegFormerBackbone
+
+# Head imports
 from models.head.sep_aspp_contrast_head import DepthwiseSeparableASPPContrastHead
+from models.head.segformer_head import SegFormerHead, UltraFastSegFormerHead, ExtremelyFastSegFormerHead
 
 # Two versions of the loss, one for 2-level and one for 3-level
 from models.loss.hiera_triplet_loss import HieraTripletLoss
 from models.loss.rmi_hiera_triplet_loss import RMIHieraTripletLoss
+
+
+# --- FACTORY FUNCTIONS ---
+def create_backbone(config):
+    """Factory function to create backbone based on config"""
+    backbone_config = config.get('backbone', {'type': 'resnet', 'depth': 101})
+    backbone_type = backbone_config.get('type', 'resnet').lower()
+
+    print(f"→ Creating {backbone_type} backbone...")
+
+    if backbone_type == 'resnet':
+        depth = backbone_config.get('depth', 101)
+        pretrained = backbone_config.get('pretrained', True)
+        return ResNetBackbone(depth=depth, pretrained=pretrained)
+    elif backbone_type == 'convnext':
+        variant = backbone_config.get('variant', 'tiny')
+        pretrained = backbone_config.get('pretrained', True)
+        return ConvNeXtBackbone(variant=variant, pretrained=pretrained)
+    elif backbone_type == 'segformer':
+        variant = backbone_config.get('variant', 'mit-b0')
+        pretrained = backbone_config.get('pretrained', True)
+        return SegFormerBackbone(variant=variant, pretrained=pretrained)
+    else:
+        raise ValueError(f"Unknown backbone type: {backbone_type}")
+
+
+def get_backbone_channels(backbone_config):
+    """Get channel dimensions for each backbone type"""
+    backbone_type = backbone_config.get('type', 'resnet').lower()
+
+    if backbone_type == 'resnet':
+        depth = backbone_config.get('depth', 101)
+        if depth in [50, 101, 152]:
+            return {'c1': 256, 'c2': 512, 'c3': 1024, 'c4': 2048}
+        elif depth in [18, 34]:
+            return {'c1': 64, 'c2': 128, 'c3': 256, 'c4': 512}
+
+    elif backbone_type == 'convnext':
+        variant = backbone_config.get('variant', 'tiny')
+        channels_map = {
+            'tiny': {'c1': 96, 'c2': 192, 'c3': 384, 'c4': 768},
+            'small': {'c1': 96, 'c2': 192, 'c3': 384, 'c4': 768},
+            'base': {'c1': 128, 'c2': 256, 'c3': 512, 'c4': 1024},
+            'large': {'c1': 192, 'c2': 384, 'c3': 768, 'c4': 1536},
+            'xlarge': {'c1': 256, 'c2': 512, 'c3': 1024, 'c4': 2048}
+        }
+        return channels_map.get(variant, channels_map['tiny'])
+
+    elif backbone_type == 'segformer':
+        variant = backbone_config.get('variant', 'mit-b0')
+        channels_map = {
+            'mit-b0': {'c1': 32, 'c2': 64, 'c3': 160, 'c4': 256},
+            'mit-b1': {'c1': 64, 'c2': 128, 'c3': 320, 'c4': 512},
+            'mit-b2': {'c1': 64, 'c2': 128, 'c3': 320, 'c4': 512},
+            'mit-b3': {'c1': 64, 'c2': 128, 'c3': 320, 'c4': 512},
+            'mit-b4': {'c1': 64, 'c2': 128, 'c3': 320, 'c4': 512},
+            'mit-b5': {'c1': 64, 'c2': 128, 'c3': 320, 'c4': 512}
+        }
+        return channels_map.get(variant, channels_map['mit-b0'])
+
+    else:
+        raise ValueError(f"Unknown backbone type: {backbone_type}")
+
+
+def create_head(config, in_channels_dict, num_classes):
+    """Factory function to create segmentation head based on config"""
+    head_config = config.get('head', {'type': 'aspp'})
+    head_type = head_config.get('type', 'aspp').lower()
+
+    print(f"→ Creating {head_type} head...")
+
+    if head_type == 'aspp':
+        # Get ASPP-specific parameters from model config
+        model_cfg = config.get('model', {})
+        return DepthwiseSeparableASPPContrastHead(
+            in_channels=in_channels_dict['c4'],
+            c1_in_channels=in_channels_dict['c1'],
+            c1_channels=model_cfg.get('c1_channels', 48),
+            aspp_channels=model_cfg.get('aspp_channels', 512),
+            dilations=tuple(model_cfg.get('aspp_dilations', [1, 12, 24, 36])),
+            num_classes=num_classes,
+            proj_dim=model_cfg.get('projection_dim', 256),
+            proj_type=model_cfg.get('projection_type', 'convmlp'),
+        )
+
+    elif head_type == 'segformer':
+        in_channels_list = [in_channels_dict['c1'], in_channels_dict['c2'],
+                           in_channels_dict['c3'], in_channels_dict['c4']]
+        return SegFormerHead(
+            in_channels_list=in_channels_list,
+            num_classes=num_classes,
+            proj_dim=head_config.get('proj_dim', 256)
+        )
+
+    elif head_type == 'ultrafast_segformer':
+        in_channels_list = [in_channels_dict['c1'], in_channels_dict['c2'],
+                           in_channels_dict['c3'], in_channels_dict['c4']]
+        return UltraFastSegFormerHead(
+            in_channels_list=in_channels_list,
+            num_classes=num_classes,
+            proj_dim=head_config.get('proj_dim', 128)
+        )
+
+    elif head_type == 'extremely_fast_segformer':
+        in_channels_list = [in_channels_dict['c1'], in_channels_dict['c2'],
+                           in_channels_dict['c3'], in_channels_dict['c4']]
+        return ExtremelyFastSegFormerHead(
+            in_channels_list=in_channels_list,
+            num_classes=num_classes,
+            proj_dim=head_config.get('proj_dim', 64)
+        )
+
+    else:
+        available_heads = ['aspp', 'segformer', 'ultrafast_segformer', 'extremely_fast_segformer']
+        raise ValueError(f"Unknown head type: {head_type}. Supported: {available_heads}")
 
 
 def parse_args():
@@ -112,6 +232,8 @@ def main():
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
 
+    train_cfg = cfg["training"]
+    
     # 1.1) If user supplied a “gpus” list, set CUDA_VISIBLE_DEVICES accordingly
     if "gpus" in cfg["training"]:
         gpu_list = cfg["training"]["gpus"]
@@ -160,32 +282,37 @@ def main():
     print(f"n_fine={n_fine}, n_coarse={n_coarse}, has_super={has_super}, n_super={n_super}")
     print(f"Total classes (output dim) = {total_classes}")
 
-    # 4) Build Backbone + Head + (Optional) Aux Head
-    backbone = ResNetBackbone(depth=101, pretrained=True).to(device)
-    aspp_head = DepthwiseSeparableASPPContrastHead(
-        in_channels=2048,
-        c1_in_channels=256,
-        c1_channels=48,
-        aspp_channels=512,
-        dilations=(1, 12, 24, 36),
-        num_classes=total_classes,
-        proj_dim=256,
-        proj_type="convmlp",
-    ).to(device)
+    # 4) Build Backbone + Head + (Optional) Aux Head using factory functions
+    print("\n" + "="*60)
+    print("BUILDING MODEL ARCHITECTURE")
+    print("="*60)
+
+    # Create backbone using factory
+    backbone = create_backbone(cfg).to(device)
+    backbone_channels = get_backbone_channels(cfg.get('backbone', {}))
+
+    print(f"   Backbone channels: C1={backbone_channels['c1']}, C2={backbone_channels['c2']}, "
+          f"C3={backbone_channels['c3']}, C4={backbone_channels['c4']}")
+
+    # Create segmentation head using factory
+    seg_head = create_head(cfg, backbone_channels, total_classes).to(device)
 
     # Auxiliary head on C3 for fine-class supervision only
     aux_head = nn.Sequential(
-        nn.Conv2d(1024, n_fine, kernel_size=1, bias=False),
+        nn.Conv2d(backbone_channels['c3'], n_fine, kernel_size=1, bias=False),
         nn.BatchNorm2d(n_fine),
         nn.ReLU(inplace=True),
     ).to(device)
+
+    print(f"   Auxiliary head: C3({backbone_channels['c3']}) → {n_fine} classes")
+    print("="*60 + "\n")
 
     # If multiple GPUs are visible, wrap each sub-module in DataParallel
     if num_visible > 1:
         print(f"→ Wrapping models in DataParallel (using {num_visible} GPUs)")
         backbone  = nn.DataParallel(backbone)
-        aspp_head = nn.DataParallel(aspp_head)
-        aux_head   = nn.DataParallel(aux_head)
+        seg_head  = nn.DataParallel(seg_head)
+        aux_head  = nn.DataParallel(aux_head)
 
     # 4.1) If --pretrained was provided, load those weights now
     if args.pretrained is not None:
@@ -203,12 +330,34 @@ def main():
             return stripped
 
         backbone_state = _strip_module(ckpt["backbone_state_dict"])
-        aspp_state     = _strip_module(ckpt["aspp_head_state_dict"])
-        aux_state      = _strip_module(ckpt["aux_head_state_dict"])
+
+        # Try different possible keys for the segmentation head
+        seg_head_keys = ['seg_head_state_dict', 'seg_head_state_dict', 'main_head_state_dict']
+        seg_head_loaded = False
+
+        for key in seg_head_keys:
+            if key in ckpt:
+                try:
+                    seg_head_state = _strip_module(ckpt[key])
+                    seg_head.load_state_dict(seg_head_state)
+                    print(f"→ Segmentation head weights loaded from '{key}'")
+                    seg_head_loaded = True
+                    break
+                except Exception as e:
+                    print(f"⚠️  Could not load seg head from '{key}': {e}")
+
+        if not seg_head_loaded:
+            print("⚠️  WARNING: Could not load segmentation head weights from checkpoint!")
+
+        # Load auxiliary head
+        if 'aux_head_state_dict' in ckpt:
+            aux_state = _strip_module(ckpt["aux_head_state_dict"])
+            aux_head.load_state_dict(aux_state)
+            print("→ Auxiliary head weights loaded")
+        else:
+            print("⚠️  WARNING: No auxiliary head weights in checkpoint!")
 
         backbone.load_state_dict(backbone_state)
-        aspp_head.load_state_dict(aspp_state)
-        aux_head.load_state_dict(aux_state)
         print("→ Pretrained weights successfully loaded (backbone + heads)")
 
     # 5) Build Loss function (either 2-level or 3-level)
@@ -229,13 +378,22 @@ def main():
         # Convert “fine_to_coarse” to a plain Python list for HieraTripletLoss
         hiera_map_list = fine_to_coarse.tolist()
 
+        # Get triplet config parameters
+        triplet_cfg = train_cfg.get("triplet", {})
+
         hiera_loss_fn = HieraTripletLoss(
             num_classes=n_fine,
             hiera_map=hiera_map_list,
             hiera_index=hiera_index,
             ignore_index=255,
             use_sigmoid=False,
-            loss_weight=cfg["training"].get("fine_weight", 1.0),
+            loss_weight=train_cfg.get("fine_weight", 1.0),
+            hiera_loss_multiplier=train_cfg.get("hiera_loss_multiplier", 5.0),
+            triplet_margin=triplet_cfg.get("margin", 0.6),
+            triplet_max_samples=triplet_cfg.get("max_samples", 200),
+            triplet_warmup_steps=triplet_cfg.get("schedule_warmup_steps", 80000),
+            triplet_min_factor=triplet_cfg.get("schedule_min_factor", 0.25),
+            triplet_max_factor=triplet_cfg.get("schedule_max_factor", 0.5),
         ).to(device)
 
         if num_visible > 1:
@@ -259,19 +417,30 @@ def main():
         n_mid  = n_coarse
         n_high = n_super
 
+        # Get triplet config parameters
+        triplet_cfg = train_cfg.get("triplet", {})
+        triplet_3level_cfg = triplet_cfg.get("schedule_warmup_steps_3level", {})
+
         hiera_loss_fn = RMIHieraTripletLoss(
             n_fine            = n_fine,
             n_mid             = n_mid,
             n_high            = n_high,
             fine_to_mid       = fine_to_mid,
             fine_to_high      = fine_to_high,
-            rmi_radius        = cfg["training"].get("rmi_radius", 3),
-            rmi_pool_way      = cfg["training"].get("rmi_pool_way", 0),
-            rmi_pool_size     = cfg["training"].get("rmi_pool_size", 3),
-            rmi_pool_stride   = cfg["training"].get("rmi_pool_stride", 3),
-            loss_weight_lambda= cfg["training"].get("fine_weight", 1.0),
+            rmi_radius        = train_cfg.get("rmi_radius", 3),
+            rmi_pool_way      = train_cfg.get("rmi_pool_way", 0),
+            rmi_pool_size     = train_cfg.get("rmi_pool_size", 3),
+            rmi_pool_stride   = train_cfg.get("rmi_pool_stride", 3),
+            loss_weight_lambda= train_cfg.get("rmi_loss_weight_lambda", 0.5),
             loss_weight       = 1.0,
             ignore_index      = 255,
+            hiera_loss_multiplier=train_cfg.get("hiera_loss_multiplier", 5.0),
+            triplet_margin=triplet_cfg.get("margin", 0.6),
+            triplet_max_samples=triplet_cfg.get("max_samples", 200),
+            triplet_warmup_steps_small=triplet_3level_cfg.get("small", 60000),
+            triplet_warmup_steps_large=triplet_3level_cfg.get("large", 160000),
+            triplet_min_factor=triplet_cfg.get("schedule_min_factor", 0.25),
+            triplet_max_factor=triplet_cfg.get("schedule_max_factor", 0.5),
         ).to(device)
 
         if num_visible > 1:
@@ -283,11 +452,11 @@ def main():
     # 7) Optimizer
     optimizer = optim.SGD(
         list(backbone.parameters())
-        + list(aspp_head.parameters())
+        + list(seg_head.parameters())
         + list(aux_head.parameters()),
-        lr=cfg["training"]["lr"],
-        momentum=0.9,
-        weight_decay=1e-4,
+        lr=train_cfg["lr"],
+        momentum=train_cfg.get("momentum", 0.9),
+        weight_decay=train_cfg.get("weight_decay", 1e-4),
     )
 
     best_val_loss = float("inf")
@@ -296,7 +465,7 @@ def main():
     # 8) Training loop
     for epoch in range(cfg["training"]["epochs"]):
         backbone.train()
-        aspp_head.train()
+        seg_head.train()
         aux_head.train()
 
         running_train_loss = 0.0
@@ -313,7 +482,7 @@ def main():
             c1, c2, c3, c4 = backbone(img_t)
 
             # 2) Main head → logits + embedding
-            main_logits, embedding = aspp_head([c1, c2, c3, c4])
+            main_logits, embedding = seg_head([c1, c2, c3, c4])
             # main_logits: [B, total_classes, H/4, W/4]
 
             B, _, H4, W4 = main_logits.shape
@@ -358,7 +527,8 @@ def main():
             )  # [B, n_fine, H, W]
             aux_loss = aux_criterion(aux_logits, fine_mask)
 
-            loss = main_loss + 0.4 * aux_loss
+            aux_loss_weight = train_cfg.get("aux_loss_weight", 0.4)
+            loss = main_loss + aux_loss_weight * aux_loss
             loss.backward()
             optimizer.step()
 
@@ -371,7 +541,7 @@ def main():
         # 9) Validation
         # -------------------------------
         backbone.eval()
-        aspp_head.eval()
+        seg_head.eval()
         aux_head.eval()
 
         running_val_loss = 0.0
@@ -385,7 +555,7 @@ def main():
                 fine_mask = batch[1].to(device, non_blocking=True)
 
                 c1, c2, c3, c4 = backbone(img_t)
-                main_logits, embedding = aspp_head([c1, c2, c3, c4])
+                main_logits, embedding = seg_head([c1, c2, c3, c4])
 
                 B, _, H4, W4 = main_logits.shape
                 H, W = fine_mask.shape[-2:]
@@ -421,7 +591,8 @@ def main():
                 )
                 aux_loss = aux_criterion(aux_logits, fine_mask)
 
-                loss = main_loss + 0.4 * aux_loss
+                aux_loss_weight = train_cfg.get("aux_loss_weight", 0.4)
+                loss = main_loss + aux_loss_weight * aux_loss
                 running_val_loss += loss.item()
 
                 # Compute pixel-accuracy on fine level
@@ -467,10 +638,12 @@ def main():
             ckpt = {
                 "epoch": last["epoch"],
                 "backbone_state_dict": backbone.module.state_dict() if num_visible > 1 else backbone.state_dict(),
-                "aspp_head_state_dict": aspp_head.module.state_dict() if num_visible > 1 else aspp_head.state_dict(),
+                "seg_head_state_dict": seg_head.module.state_dict() if num_visible > 1 else seg_head.state_dict(),
                 "aux_head_state_dict": aux_head.module.state_dict() if num_visible > 1 else aux_head.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "config": cfg
+                "config": cfg,
+                "backbone_config": cfg.get('backbone', {}),  # Save backbone config for inference
+                "head_config": cfg.get('head', {})  # Save head config for inference
             }
             os.makedirs(cfg["output"]["checkpoint_dir"], exist_ok=True)
             save_path = os.path.join(
@@ -487,7 +660,7 @@ def main():
     # =============================================================================
     print("\n## Computing per-fine-class pixel accuracy on val set ...\n")
     backbone.eval()
-    aspp_head.eval()
+    seg_head.eval()
 
     per_class_correct = torch.zeros(n_fine, dtype=torch.long, device=device)
     per_class_total   = torch.zeros(n_fine, dtype=torch.long, device=device)
@@ -498,7 +671,7 @@ def main():
             fine_mask = batch[1].to(device, non_blocking=True)  # [B, H, W]
 
             c1, c2, c3, c4 = backbone(img_t)
-            logits, _ = aspp_head([c1, c2, c3, c4])
+            logits, _ = seg_head([c1, c2, c3, c4])
 
             B, _, H4, W4 = logits.shape
             H, W = fine_mask.shape[-2:]

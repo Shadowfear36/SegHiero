@@ -1,3 +1,94 @@
-venv
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+venv.bak/
+
+# PyTorch checkpoints
+*.pth
+*.pt
+*.ckpt
+checkpoints/
+*.tar
+
+# Datasets
+data/
+datasets/
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.npy
+*.npz
+*.h5
+
+# Outputs
+outputs/
+runs/
+logs/
+weights/
+inference_outputs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Ray Serve
+ray_results/
+ray_logs/
+
+# Wandb & MLflow
+wandb/
+mlruns/
+
+# TensorBoard
+events.out.tfevents.*
+
+# Temporary
+tmp/
+temp/
+*.tmp
+
+# Keep example configs
+!example-config.yaml
+!example-config.yml
+
+# User configs (keep private)
 2l-config.yaml
 3l-config.yaml
+my-*.yaml

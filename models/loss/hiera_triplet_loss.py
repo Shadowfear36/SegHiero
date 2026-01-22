@@ -43,17 +43,19 @@ def _losses_hiera_two_level(predictions: torch.Tensor,
                             targets_coarse: torch.Tensor,
                             n_fine: int,
                             hiera_index: list,
+                            multiplier: float = 5.0,
                             eps: float = 1e-8):
     """
-    Exactly the same 2‐level “hierarchical” loss you had before:
+    Exactly the same 2‐level "hierarchical" loss you had before:
       - predictions: [B, n_fine + n_coarse, H, W] (logits before sigmoid)
       - targets_fine:   [B, H, W]  ints in [0..n_fine−1] or 255
       - targets_coarse: [B, H, W]  ints in [0..n_coarse−1] or 255
       - n_fine:       number of fine classes
       - hiera_index:  list of length = n_coarse, each = [start, end]
+      - multiplier:   multiplier for the hierarchical loss term
 
     Returns:
-      scalar loss = 5 * (fine_term + coarse_term).
+      scalar loss = multiplier * (fine_term + coarse_term).
     """
     b, C, H, W = predictions.shape
     n_coarse = len(hiera_index)
@@ -104,7 +106,7 @@ def _losses_hiera_two_level(predictions: torch.Tensor,
                     - (1 - oh_c) * torch.log(1 - MCMB + eps))
                    * valid_c).sum() / (num_valid_c * n_coarse)
 
-    return 5.0 * (loss_fine + loss_coarse)
+    return multiplier * (loss_fine + loss_coarse)
 
 
 class HieraTripletLoss(nn.Module):
@@ -132,7 +134,13 @@ class HieraTripletLoss(nn.Module):
                  hiera_index: list,
                  ignore_index: int = 255,
                  use_sigmoid: bool = False,
-                 loss_weight: float = 1.0):
+                 loss_weight: float = 1.0,
+                 hiera_loss_multiplier: float = 5.0,
+                 triplet_margin: float = 0.6,
+                 triplet_max_samples: int = 200,
+                 triplet_warmup_steps: int = 80000,
+                 triplet_min_factor: float = 0.25,
+                 triplet_max_factor: float = 0.5):
         super().__init__()
         self.num_classes  = num_classes        # = n_fine
         self.hiera_map    = hiera_map          # length n_fine, maps each fine→coarse
@@ -140,12 +148,20 @@ class HieraTripletLoss(nn.Module):
         self.ignore_index = ignore_index
         self.ce           = CrossEntropyLoss()
 
+        # Store configurable parameters
+        self.hiera_loss_multiplier = hiera_loss_multiplier
+        self.triplet_warmup_steps = triplet_warmup_steps
+        self.triplet_min_factor = triplet_min_factor
+        self.triplet_max_factor = triplet_max_factor
+
         # Pass hiera_map & hiera_index into TreeTripletLoss
         self.triplet_loss_fn = TreeTripletLoss(
             num_classes=len(hiera_map),
             hiera_map=hiera_map,
             hiera_index=hiera_index,
-            ignore_index=ignore_index
+            ignore_index=ignore_index,
+            margin=triplet_margin,
+            max_samples=triplet_max_samples
         )
         self.loss_weight = loss_weight
 
@@ -176,7 +192,8 @@ class HieraTripletLoss(nn.Module):
             targets_fine,
             targets_coarse,
             self.num_classes,
-            self.hiera_index
+            self.hiera_index,
+            multiplier=self.hiera_loss_multiplier
         )
 
         # 3) Add plain CrossEntropy on fine / coarse slices
@@ -200,12 +217,11 @@ class HieraTripletLoss(nn.Module):
             ready = (class_count.item() > 0)
 
         if ready:
-            # same cosine schedule:  factor = 0.25 * (1 + cos((step−80k)/80k * π)), else 0.5
-            all_step = 80000
-            if step.item() < all_step:
-                factor = 0.25 * (1 + math.cos((step.item() - all_step) / all_step * math.pi))
+            # Cosine schedule with configurable parameters
+            if step.item() < self.triplet_warmup_steps:
+                factor = self.triplet_min_factor * (1 + math.cos((step.item() - self.triplet_warmup_steps) / self.triplet_warmup_steps * math.pi))
             else:
-                factor = 0.5
+                factor = self.triplet_max_factor
             loss = loss + factor * loss_triplet
 
         return loss * self.loss_weight

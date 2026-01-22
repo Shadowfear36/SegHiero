@@ -17,9 +17,13 @@ class TreeTripletLoss(nn.Module):
     def __init__(self,
                  fine_to_mid: torch.Tensor,
                  fine_to_high: torch.Tensor,
-                 ignore_index: int = 255):
+                 ignore_index: int = 255,
+                 margin: float = 0.6,
+                 max_samples: int = 200):
         super().__init__()
         self.ignore_label = ignore_index
+        self.margin = margin
+        self.max_samples = max_samples
 
         # Store the mapping vectors as buffers so they follow .to(device)
         assert fine_to_mid.dtype == torch.long
@@ -27,11 +31,14 @@ class TreeTripletLoss(nn.Module):
         self.register_buffer('fine_to_mid',  fine_to_mid.clone())
         self.register_buffer('fine_to_high', fine_to_high.clone())
 
-    def forward(self, feats: torch.Tensor, labels: torch.Tensor, max_triplet: int = 200):
+    def forward(self, feats: torch.Tensor, labels: torch.Tensor, max_triplet: int = None):
         """
         feats:   [B, D, H_feat, W_feat]  (embedding to form triplets)
         labels:  [B, H_label, W_label]    (fine‐level ground truth in [0..n_fine−1] or ignore_index)
         """
+        if max_triplet is None:
+            max_triplet = self.max_samples
+
         device = feats.device
         B, D, Hf, Wf = feats.shape
 
@@ -96,8 +103,8 @@ class TreeTripletLoss(nn.Module):
             dist_pos = 1.0 - (feats_anchor * feats_pos).sum(dim=1)
             dist_neg = 1.0 - (feats_anchor * feats_neg).sum(dim=1)
 
-            # Margin: 0.6
-            margin = 0.6 * torch.ones(min_size, device=device)
+            # Use configurable margin
+            margin = self.margin * torch.ones(min_size, device=device)
 
             # Triplet margin loss: max(0, d_pos − d_neg + margin)
             tl = dist_pos - dist_neg + margin

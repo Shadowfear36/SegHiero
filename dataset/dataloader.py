@@ -97,8 +97,8 @@ class HieroDataloader(Dataset):
         root_dir = ds_cfg['root']
 
         # Strip leading slash so os.path.join works
-        sub_img = ds_cfg[split]['image_subdir'].lstrip("/\\")
-        sub_msk = ds_cfg[split]['mask_subdir'].lstrip("/\\")
+        sub_img = ds_cfg[split]['image_folder'].lstrip("/\\")
+        sub_msk = ds_cfg[split]['mask_folder'].lstrip("/\\")
         self.img_dir = os.path.join(root_dir, sub_img)
         self.msk_dir = os.path.join(root_dir, sub_msk)
 
@@ -147,7 +147,17 @@ class HieroDataloader(Dataset):
                 if tf_cfg.get('resize') is not None:
                     resize = (int(tf_cfg['resize'][0]), int(tf_cfg['resize'][1]))
                 hflip_prob = float(tf_cfg.get('hflip_prob', 0.5))
-                self.transform = JointTransform(resize=resize, hflip_prob=hflip_prob)
+
+                # Get normalization parameters from config
+                normalize_mean = tuple(tf_cfg.get('normalize_mean', [0.485, 0.456, 0.406]))
+                normalize_std = tuple(tf_cfg.get('normalize_std', [0.229, 0.224, 0.225]))
+
+                self.transform = JointTransform(
+                    resize=resize,
+                    hflip_prob=hflip_prob,
+                    normalize_mean=normalize_mean,
+                    normalize_std=normalize_std
+                )
             else:
                 self.transform = None
 

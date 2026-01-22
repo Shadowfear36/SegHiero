@@ -1,5 +1,3 @@
-# base_decode_head.py
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -68,7 +66,7 @@ class BaseDecodeHead(nn.Module, metaclass=ABCMeta):
         *,
         num_classes,
         dropout_ratio=0.1,
-        conv_cfg=None,      # ignored in this PyTorch version
+        conv_cfg=None,      # ignored
         norm_cfg=None,      # ignored
         act_cfg=None,       # ignored
         in_index=-1,

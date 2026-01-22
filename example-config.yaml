@@ -1,50 +1,132 @@
 dataset:
-    root: '/path/to/your/dataset'
-    train:
-      image_subdir: '/subdir'
-      mask_subdir: '/subdir'
-    val:
-      image_subdir: '/subdir'
-      mask_subdir: '/subdir'
+  root: '/path/to/your/dataset'
+  train:
+    image_subdir: '/subdir'
+    mask_subdir: '/subdir'
+  val:
+    image_subdir: '/subdir'
+    mask_subdir: '/subdir'
+
 classes:
-    super_coarse_to_coarse_map: [[0, 2], [3]]
-    super_coarse_names:
-      0: Plant
-      1: Fungus
-    coarse_to_fine_map: [[0,3], [4,6], [7], [8]]
-    coarse_names:
-      0: Flower
-      1: Tree
-      2: Grass
-      3: Mushroom
-    fine_names:
-      0: Sunflower
-      1: Lily
-      2: Rose
-      3: Tulip
-      4: Juniper
-      5: Oak
-      6: Palm
-      7: Bermuda
-      8: Lions Mane
-    
+  super_coarse_to_coarse_map: [[0, 2], [3]]
+  super_coarse_names:
+    0: Plant
+    1: Fungus
+  coarse_to_fine_map: [[0,3], [4,6], [7], [8]]
+  coarse_names:
+    0: Flower
+    1: Tree
+    2: Grass
+    3: Mushroom
+  fine_names:
+    0: Sunflower
+    1: Lily
+    2: Rose
+    3: Tulip
+    4: Juniper
+    5: Oak
+    6: Palm
+    7: Bermuda
+    8: Lions Mane
+
+# ============================================================================
+# BACKBONE CONFIGURATION
+# ============================================================================
+# Choose ONE backbone configuration below (comment out the others)
+
+# Option 1: ResNet Backbone (default, stable, high accuracy)
+backbone:
+  type: "resnet"
+  depth: 101                       # Options: 18, 34, 50, 101, 152
+  pretrained: true                 # Use ImageNet pretrained weights
+
+# Option 2: ConvNeXt Backbone (modern CNN, excellent accuracy)
+# backbone:
+#   type: "convnext"
+#   variant: "tiny"                # Options: tiny, small, base, large, xlarge
+#   pretrained: true
+
+# Option 3: SegFormer Backbone (transformer-based, best for SegFormer heads)
+# backbone:
+#   type: "segformer"
+#   variant: "mit-b0"              # Options: mit-b0, mit-b1, mit-b2, mit-b3, mit-b4, mit-b5
+#   pretrained: true
+
+# ============================================================================
+# HEAD CONFIGURATION
+# ============================================================================
+# Choose ONE head configuration below (comment out the others)
+
+# Option 1: ASPP Head (works with all backbones, proven architecture)
+head:
+  type: "aspp"
+
+# Option 2: Standard SegFormer Head (best with SegFormer backbone)
+# head:
+#   type: "segformer"
+#   proj_dim: 256                  # Projection dimension for embeddings
+
+# Option 3: UltraFast SegFormer Head (optimized for speed)
+# head:
+#   type: "ultrafast_segformer"
+#   proj_dim: 128
+
+# Option 4: Extremely Fast SegFormer Head (maximum speed, slight accuracy tradeoff)
+# head:
+#   type: "extremely_fast_segformer"
+#   proj_dim: 64
+
+# ============================================================================
+# MODEL PARAMETERS (used by ASPP head)
+# ============================================================================
 model:
   pretrained_model: resnet-101
+  c1_channels: 48                  # Channels for C1 skip connection
+  aspp_channels: 512               # Output channels for each ASPP branch
+  aspp_dilations: [1, 12, 24, 36]  # Dilation rates for ASPP
+  projection_dim: 256              # Embedding dimension for triplet loss
+  projection_type: "convmlp"       # Projection head type: "convmlp" or "linear"
 
 training:
   epochs: 50
   batch_size: 8
   lr: 0.001
+  momentum: 0.9                    # SGD momentum
+  weight_decay: 0.0001             # L2 regularization weight decay
   device: "cuda"
+  num_workers: 1
+  gpus: [0]
+
+  # Loss weights
   fine_weight: 1.0
   coarse_weight: 1.0
-  super_weight:   1.0 
-  num_workers:  1
-  gpus: [0]
+  super_weight: 1.0
+  aux_loss_weight: 0.4             # Weight for auxiliary head loss
+  hiera_loss_multiplier: 5.0       # Multiplier for hierarchical loss term
+
+  # RMI parameters (used only for 3-level hierarchy)
+  rmi_radius: 3
+  rmi_pool_way: 0
+  rmi_pool_size: 3
+  rmi_pool_stride: 3
+  rmi_loss_weight_lambda: 0.5      # Balance between RMI and hierarchical loss
+
+  # Triplet loss parameters
+  triplet:
+    margin: 0.6                    # Margin for triplet loss
+    max_samples: 200               # Max triplet samples per class per batch
+    schedule_warmup_steps: 80000   # Warmup steps for 2-level triplet scheduling
+    schedule_warmup_steps_3level:  # Warmup steps for 3-level triplet scheduling
+      small: 60000                 # When n_fine <= 15
+      large: 160000                # When n_fine > 15
+    schedule_min_factor: 0.25      # Minimum factor during warmup
+    schedule_max_factor: 0.5       # Maximum factor after warmup
 
 transform:
   resize: [150, 150]
   hflip_prob: 0.5
+  normalize_mean: [0.485, 0.456, 0.406]  # ImageNet mean
+  normalize_std: [0.229, 0.224, 0.225]   # ImageNet std
 
 output:
   checkpoint_dir: "./"

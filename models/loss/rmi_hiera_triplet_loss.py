@@ -101,7 +101,14 @@ class RMIHieraTripletLoss(nn.Module):
                  rmi_pool_stride: int = 3,
                  loss_weight_lambda: float = 0.5,
                  loss_weight: float   = 1.0,
-                 ignore_index: int    = 255):
+                 ignore_index: int    = 255,
+                 hiera_loss_multiplier: float = 5.0,
+                 triplet_margin: float = 0.6,
+                 triplet_max_samples: int = 200,
+                 triplet_warmup_steps_small: int = 60000,
+                 triplet_warmup_steps_large: int = 160000,
+                 triplet_min_factor: float = 0.25,
+                 triplet_max_factor: float = 0.5):
         super().__init__()
 
         assert fine_to_mid.dtype == torch.long
@@ -129,15 +136,24 @@ class RMIHieraTripletLoss(nn.Module):
         self.d        = 2 * self.half_d
         self.kernel_padding = self.rmi_pool_size // 2
 
+        # Store configurable parameters
+        self.hiera_loss_multiplier = hiera_loss_multiplier
+        self.triplet_warmup_steps_small = triplet_warmup_steps_small
+        self.triplet_warmup_steps_large = triplet_warmup_steps_large
+        self.triplet_min_factor = triplet_min_factor
+        self.triplet_max_factor = triplet_max_factor
+
         # Plain CrossEntropy on fine/mid/high slices:
         self.ce = CrossEntropyLoss()
 
-        # Triplet‐loss on the “embedding”:
+        # Triplet‐loss on the "embedding":
         # We now pass both mapping vectors so TreeTripletLoss knows fine→mid and fine→high
         self.triplet_loss = TreeTripletLoss(
             fine_to_mid  = self.fine_to_mid,
             fine_to_high = self.fine_to_high,
-            ignore_index = self.ignore_index
+            ignore_index = self.ignore_index,
+            margin = triplet_margin,
+            max_samples = triplet_max_samples
         )
 
     def map_get_pairs(self, labels_4D, probs_4D, radius=3, is_combine=True):
@@ -339,7 +355,7 @@ class RMIHieraTripletLoss(nn.Module):
             * valid_h
         ).sum() / (num_valid_h * self.n_high)
 
-        hiera_loss = 5.0 * (loss_f + loss_m + loss_h)
+        hiera_loss = self.hiera_loss_multiplier * (loss_f + loss_m + loss_h)
 
         # ---------------------------------------------------------------------
         # 3) RMI‐lower‐bound term on Sigmoid‐probabilities
@@ -399,11 +415,12 @@ class RMIHieraTripletLoss(nn.Module):
             ready = (class_count.item() > 0)
 
         if ready:
-            total_steps = 160000 if self.n_fine > 15 else 60000
+            # Use configurable warmup steps based on number of fine classes
+            total_steps = self.triplet_warmup_steps_large if self.n_fine > 15 else self.triplet_warmup_steps_small
             if step.item() < total_steps:
-                factor = 0.25 * (1 + math.cos((step.item() - total_steps) / total_steps * math.pi))
+                factor = self.triplet_min_factor * (1 + math.cos((step.item() - total_steps) / total_steps * math.pi))
             else:
-                factor = 0.5
+                factor = self.triplet_max_factor
             final_loss = final_loss + factor * loss_triplet
 
         return final_loss * self.loss_weight

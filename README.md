@@ -15,23 +15,45 @@ This README explains:
 
 ---
 
+## 🌟 New: Multi-Architecture Support
+
+SegHiero now supports **multiple backbones and segmentation heads** that can be easily swapped via YAML configuration:
+
+**Supported Backbones:**
+- ResNet (18, 34, 50, 101, 152) - Proven stability
+- ConvNeXt (tiny, small, base, large, xlarge) - Modern CNN performance
+- SegFormer (MiT-B0 through MiT-B5) - State-of-the-art transformer
+
+**Supported Heads:**
+- ASPP Head - Multi-scale context (works with all backbones)
+- SegFormer Head - Best accuracy with SegFormer backbone
+- UltraFast SegFormer Head - ~40% faster, <2% accuracy loss
+- Extremely Fast SegFormer Head - ~60% faster for real-time applications
+
+See [ARCHITECTURE_INTEGRATION_GUIDE.md](ARCHITECTURE_INTEGRATION_GUIDE.md) for detailed information and [CONFIG_EXAMPLES.md](CONFIG_EXAMPLES.md) for copy-paste configurations.
+
+---
+
 ## Table of Contents
 
-1. [What Is Hierarchical Semantic Segmentation?](#what-is-hierarchical-semantic-segmentation)  
-2. [Project Structure](#project-structure)  
-3. [Installation](#installation)  
-4. [Dataset & Label Preparation](#dataset--label-preparation)  
-5. [Config File Format](#config-file-format)  
-   - [1. Dataset Section](#1-dataset-section)  
-   - [2. Classes Section](#2-classes-section)  
-   - [3. Model Section](#3-model-section)  
-   - [4. Training Section](#4-training-section)  
-   - [5. Transform Section](#5-transform-section)  
-   - [6. Output Section](#6-output-section)  
-6. [Training & Validation](#training--validation)  
-7. [Inference](#inference)  
-8. [Custom Backbones / Heads](#custom-backbones--heads)  
-9. [License & Acknowledgments](#license--acknowledgments)
+1. [What Is Hierarchical Semantic Segmentation?](#what-is-hierarchical-semantic-segmentation)
+2. [Project Structure](#project-structure)
+3. [Installation](#installation)
+4. [Dataset & Label Preparation](#dataset--label-preparation) - See also: [DATASET_PREPARATION_GUIDE.md](DATASET_PREPARATION_GUIDE.md)
+5. [**Architecture Configuration (NEW)**](#architecture-configuration)
+6. [Config File Format](#config-file-format)
+   - [1. Dataset Section](#1-dataset-section)
+   - [2. Classes Section](#2-classes-section)
+   - [3. Backbone Section (NEW)](#3-backbone-section)
+   - [4. Head Section (NEW)](#4-head-section)
+   - [5. Model Section](#5-model-section)
+   - [6. Training Section](#6-training-section)
+   - [7. Transform Section](#7-transform-section)
+   - [8. Output Section](#8-output-section)
+7. [Training & Validation](#training--validation)
+8. [Inference](#inference)
+9. [Custom Backbones / Heads](#custom-backbones--heads)
+10. [License & Acknowledgments](#license--acknowledgments)
 
 ---
 
@@ -65,23 +87,34 @@ SegHiero implements two popular strategies:
 ```
 SegHiero/
 ├── dataset/
-│ └── dataloader.py # HieroDataloader implementation
+│   └── dataloader.py                  # HieroDataloader implementation
 │
 ├── models/
-│ ├── backbone/
-│ │ └── resnet.py # ResNetBackbone (vanilla PyTorch)
-│ ├── head/
-│ │ └── sep_aspp_contrast_head.py # DepthwiseSeparableASPPContrastHead
-│ └── loss/
-│ ├── cross_entropy_loss.py # Wrapper around torch.nn.CrossEntropyLoss
-│ ├── tree_triplet_loss.py # Triplet‐loss for hierarchical embeddings
-│ ├── hiera_triplet_loss.py # 2‐level HieraTripletLoss
-│ └── rmi_hiera_triplet_loss.py # 3‐level RMIHieraTripletLoss
+│   ├── backbone/
+│   │   ├── resnet.py                  # ResNet (18, 34, 50, 101, 152)
+│   │   ├── convnext.py                # ConvNeXt (NEW)
+│   │   └── segformer.py               # SegFormer MiT (NEW)
+│   ├── head/
+│   │   ├── sep_aspp_contrast_head.py  # ASPP Head
+│   │   └── segformer_head.py          # SegFormer Heads (NEW - 3 variants)
+│   └── loss/
+│       ├── cross_entropy_loss.py      # CE Loss wrapper
+│       ├── tree_triplet_loss.py       # Hierarchical triplet loss
+│       ├── hiera_triplet_loss.py      # 2-level HieraTripletLoss
+│       └── rmi_hiera_triplet_loss.py  # 3-level RMIHieraTripletLoss
 │
-├── train.py # Main training & validation script, consumes a single YAML config
-├── infer.py # Main inference script, consumes a single YAML config, image path, checkpoint path, device, and output directory
-├── requirements.txt # Dependencies
-└── example-config.yaml # Example hierarchy config
+├── train.py                           # Main training script (with factory functions)
+├── infer.py                           # Inference script
+├── example-config.yaml                # Example config with all architectures
+├── requirements.txt                   # Dependencies
+├── tools/
+│   ├── coco_to_seghiero.py            # COCO converter script (NEW)
+│   ├── coco_mapping_example.yaml      # Example COCO mapping (NEW)
+│   └── README.md                      # Tools documentation (NEW)
+├── ARCHITECTURE_INTEGRATION_GUIDE.md  # Comprehensive architecture guide (NEW)
+├── CONFIG_EXAMPLES.md                 # Quick config examples (NEW)
+├── DATASET_PREPARATION_GUIDE.md       # Dataset creation guide (NEW)
+└── CONTRIBUTING.md                    # How to contribute
 ```
 
 
@@ -152,16 +185,69 @@ SegHiero/
 
 
 ## Dataset & Label Preparation
-- **SegHiero Expects:**
-    - A root Directory Structured like:
-        ```
-        root/
-            train/images/       # RGB images for training
-            train/masks/        # “Fine‐level” masks (each pixel ∈ {0..n_fine−1} or 255 ignore)
-            val/images/         # RGB images for validation
-            val/masks/          # Fine‐level masks for validation
-        ```
-    - **Fine‐level masks** must use integer labels in ``[0..n_fine−1]`` and ``255`` for “ignore” pixels.
+
+SegHiero expects a simple directory structure with images and fine-level masks:
+
+```
+root/
+    train/images/       # RGB images for training
+    train/masks/        # Fine‐level masks (each pixel ∈ {0..n_fine−1} or 255 ignore)
+    val/images/         # RGB images for validation
+    val/masks/          # Fine‐level masks for validation
+```
+
+**Key points:**
+- Fine-level masks use integer labels in `[0..n_fine−1]` and `255` for "ignore" pixels
+- The hierarchical grouping (fine → coarse → super) is defined in your config file, not in the masks
+- See [DATASET_PREPARATION_GUIDE.md](DATASET_PREPARATION_GUIDE.md) for detailed instructions on creating masks, defining hierarchies, and troubleshooting
+- See [tools/](tools/) for conversion scripts (COCO, Cityscapes, etc.)
+
+---
+
+## Architecture Configuration
+
+SegHiero now supports multiple backbones and heads through a **factory pattern**. Simply edit your YAML config to switch architectures!
+
+### Quick Examples
+
+**ResNet + ASPP (Default, Proven):**
+```yaml
+backbone:
+  type: "resnet"
+  depth: 101
+  pretrained: true
+
+head:
+  type: "aspp"
+```
+
+**SegFormer + SegFormer Head (Best Accuracy):**
+```yaml
+backbone:
+  type: "segformer"
+  variant: "mit-b0"
+  pretrained: true
+
+head:
+  type: "segformer"
+  proj_dim: 256
+```
+
+**SegFormer + UltraFast Head (Speed/Accuracy Balance):**
+```yaml
+backbone:
+  type: "segformer"
+  variant: "mit-b0"
+  pretrained: true
+
+head:
+  type: "ultrafast_segformer"
+  proj_dim: 128
+```
+
+See [ARCHITECTURE_INTEGRATION_GUIDE.md](ARCHITECTURE_INTEGRATION_GUIDE.md) for comprehensive documentation and [CONFIG_EXAMPLES.md](CONFIG_EXAMPLES.md) for more configurations.
+
+---
 
 ## Config File Format
 Every training run is driven by a single YAML file. Below is a breakdown of each section.
@@ -236,14 +322,47 @@ Every training run is driven by a single YAML file. Below is a breakdown of each
         - ``coarse_to_fine_map``, ``coarse_names``, ``fine_names``: As before.
         - When ``super_coarse_to_coarse_map`` exists, the script uses three‐level loss (``RMIHieraTripletLoss``).
 
-## 3. **``model`` Section**
+## 3. **``backbone`` Section (NEW)**
     ```yaml
-        model:
-            pretrained_model: resnet-101
+backbone:
+  type: "resnet"           # Options: resnet, convnext, segformer
+  depth: 101               # For ResNet: 18, 34, 50, 101, 152
+  # variant: "tiny"        # For ConvNeXt: tiny, small, base, large, xlarge
+  # variant: "mit-b0"      # For SegFormer: mit-b0, mit-b1, mit-b2, mit-b3, mit-b4, mit-b5
+  pretrained: true         # Use ImageNet pretrained weights
     ```
-    Currently strictly informational; by default, ``train.py`` uses ``ResNetBackbone(depth=101, pretrained=True)``. In future update it will allow for choice of multiple backbones.
+    - ``type``: Backbone architecture to use
+    - ``depth`` (ResNet only): Network depth
+    - ``variant`` (ConvNeXt/SegFormer): Model variant
+    - ``pretrained``: Whether to load ImageNet pretrained weights
 
-## 4. **``training`` Section**
+## 4. **``head`` Section (NEW)**
+    ```yaml
+head:
+  type: "aspp"             # Options: aspp, segformer, ultrafast_segformer, extremely_fast_segformer
+  proj_dim: 256            # For SegFormer heads: embedding dimension (optional)
+    ```
+    - ``type``: Segmentation head architecture
+    - ``proj_dim`` (SegFormer heads only): Projection dimension for embedding learning
+      - Standard SegFormer: 256 (default)
+      - UltraFast: 128 (default)
+      - Extremely Fast: 64 (default)
+
+## 5. **``model`` Section**
+    ```yaml
+model:
+  pretrained_model: resnet-101
+  c1_channels: 48
+  aspp_channels: 512
+  aspp_dilations: [1, 12, 24, 36]
+  projection_dim: 256
+  projection_type: "convmlp"
+    ```
+    - This section is now **only used for ASPP head configuration**
+    - If using SegFormer heads, these parameters are ignored
+    - The factory functions automatically handle channel dimensions based on your chosen backbone
+
+## 6. **``training`` Section**
     ```yaml
         training:
             epochs: 50
@@ -258,7 +377,7 @@ Every training run is driven by a single YAML file. Below is a breakdown of each
     ```
     - The script sets ``CUDA_VISIBLE_DEVICES`` from ``gpus``.
     - If ``gpus: []``, runs on CPU.
-## 5. **``transform`` Section**
+## 7. **``transform`` Section**
     ```yaml
         transform:
             resize:     [150, 150]   # Resize each image & mask to 150×150
@@ -267,7 +386,7 @@ Every training run is driven by a single YAML file. Below is a breakdown of each
     - When provided, ``HieroDataloader`` resizes both image and mask, then randomly flips with probability ``hflip_prob``.
     - If omitted, loader applies ``ToTensor()`` + normalization ``(0.485,0.456,0.406)/(0.229,0.224,0.225)``.
 
-## 6. **``output`` Section**
+## 8. **``output`` Section**
     ```yaml
         output:
             checkpoint_dir: "./checkpoints"
@@ -318,15 +437,55 @@ Every training run is driven by a single YAML file. Below is a breakdown of each
 
 
 ## Custom Backbones / Heads
-- You can swap in any backbone or head that matches SegHiero’s expectations:
-    - **Backbone**: Must return four feature maps at strides 4, 8, 16, 32.
-        E.g. replace ``ResNetBackbone`` in train.py (lines 115–118) with ``UNet`` or ``HRNet``.
-    - **Head**: Must accept a list of four feature maps and return ``(logits, embedding)``:
-        - ``logits``: ``[B, total_classes, H/4, W/4]``
-        - ``embedding``: ``[B, D, H/8, W/8]`` (for triplet loss) If your head does not produce embeddings, you can modify the loss to ignore triplet scheduling.
-    - **Loss Functions**:
-        - Two‐level: ``HieraTripletLoss(num_classes, hiera_map, hiera_index, use_sigmoid=False, loss_weight=…)``
-        - Three‐level: ``RMIHieraTripletLoss(n_fine, n_mid, n_high, fine_to_mid, fine_to_high, rmi_radius, rmi_pool_way, rmi_pool_size, rmi_pool_stride, loss_weight_lambda, loss_weight, ignore_index)``
+
+SegHiero uses a **factory pattern** that makes adding new architectures easy!
+
+### Adding a New Backbone
+
+1. Create your backbone file in `models/backbone/your_backbone.py`
+2. Implement the standard interface (returns C1, C2, C3, C4 features)
+3. Add import in `train.py`:
+   ```python
+   from models.backbone.your_backbone import YourBackbone
+   ```
+4. Add case to `create_backbone()` factory function (train.py:30-50):
+   ```python
+   elif backbone_type == 'your_backbone':
+       return YourBackbone(...)
+   ```
+5. Add channel mapping to `get_backbone_channels()` (train.py:53-88):
+   ```python
+   elif backbone_type == 'your_backbone':
+       return {'c1': ..., 'c2': ..., 'c3': ..., 'c4': ...}
+   ```
+
+### Adding a New Head
+
+1. Create your head file in `models/head/your_head.py`
+2. Implement the standard interface:
+   - Input: List of four feature maps `[c1, c2, c3, c4]`
+   - Output: `(logits, embedding)` tuple where:
+     - `logits`: `[B, total_classes, H/4, W/4]`
+     - `embedding`: `[B, D, H/8, W/8]` (for triplet loss)
+3. Add import in `train.py`:
+   ```python
+   from models.head.your_head import YourHead
+   ```
+4. Add case to `create_head()` factory function (train.py:91-141):
+   ```python
+   elif head_type == 'your_head':
+       return YourHead(...)
+   ```
+
+See [ARCHITECTURE_INTEGRATION_GUIDE.md](ARCHITECTURE_INTEGRATION_GUIDE.md) for detailed instructions.
+
+### Requirements for Custom Architectures
+
+- **Backbone**: Must return four feature maps at strides 4, 8, 16, 32.
+- **Head**: Must accept a list of four feature maps and return `(logits, embedding)`
+- **Loss Functions** (unchanged):
+    - Two‐level: `HieraTripletLoss(num_classes, hiera_map, hiera_index, use_sigmoid=False, loss_weight=…)`
+    - Three‐level: `RMIHieraTripletLoss(n_fine, n_mid, n_high, fine_to_mid, fine_to_high, ...)`
 ## License & Acknowledgements
 **Inspired by**
 - HieraSeg [https://github.com/lingorX/HieraSeg]
